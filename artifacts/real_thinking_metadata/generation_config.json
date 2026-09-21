@@ -1,0 +1,7 @@
+{
+  "max_new_tokens": 32768,
+  "repetition_penalty": 1.0,
+  "temperature": 0.6,
+  "top_k": 20,
+  "top_p": 0.95
+}

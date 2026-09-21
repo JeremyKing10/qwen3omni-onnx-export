@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# 大型第三方源码克隆（体积过大，用 scripts/bootstrap.sh 重新拉取固定版本）
+Qwen3-Omni/
+transformers-v5.2.0/
+TensorRT-Edge-LLM-v0.10.1/
+
+# 生成产物（全部可由流水线重新生成；保留参考元数据）
+artifacts/*
+!artifacts/real_thinking_metadata
+
+# 本地生成的产品包（由 run_local_thinking_pipeline.py 重建）
+Qwen3-Omni-30B-A3B-Thinking-ONNX/
+
+# 官方模型权重（绝不入库）
+*.safetensors
+*.bin
+model.onnx.data
+
+# 系统与日志
+.DS_Store
+*.log

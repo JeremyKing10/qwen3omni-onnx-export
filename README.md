@@ -125,32 +125,41 @@ Qwen3-Omni-30B-A3B-Thinking-ONNX/
 
 **哪个 ONNX 由哪条命令产出**（全仓库一共 7 个 `model.onnx`）：
 
-| 产物路径 | 导出命令 |
-|---|---|
-| `artifacts/rmsnorm/model.onnx` | `python export_onnx.py --case rmsnorm --output-dir artifacts/rmsnorm --force` |
-| `artifacts/moe_block/model.onnx` | `python export_onnx.py --case moe_block --output-dir artifacts/moe_block --force` |
-| `artifacts/tiny_thinker/model.onnx` | `python export_onnx.py --case tiny_thinker --output-dir artifacts/tiny_thinker --force` |
-| `Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/vision_encoder/model.onnx` | `python export_thinking_onnx.py --mode tiny --component vision_encoder --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX --force` |
-| `.../onnx/audio_encoder/model.onnx` | 同上，`--component audio_encoder` |
-| `.../onnx/thinker_prefill/model.onnx` | 同上，`--component thinker_prefill` |
-| `.../onnx/thinker_decode/model.onnx` | 同上，`--component thinker_decode` |
+**A. `artifacts/` 下的三个（早期三级 tiny 回归，`export_onnx.py`）**
 
-> 四个组件实际上一条命令就能全出：`--component all`（见 5.1）。
+```bash
+python export_onnx.py --case rmsnorm      --output-dir artifacts/rmsnorm      --force
+python export_onnx.py --case moe_block    --output-dir artifacts/moe_block    --force
+python export_onnx.py --case tiny_thinker --output-dir artifacts/tiny_thinker --force
+```
+
+**B. `Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/` 下的四个（`export_thinking_onnx.py`）**
+
+```bash
+python export_thinking_onnx.py --mode tiny --component vision_encoder --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX --force
+python export_thinking_onnx.py --mode tiny --component audio_encoder  --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX --force
+python export_thinking_onnx.py --mode tiny --component thinker_prefill --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX --force
+python export_thinking_onnx.py --mode tiny --component thinker_decode  --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX --force
+```
+
+逐条对应：
+
+- `onnx/vision_encoder/model.onnx` ← 第一条（`--component vision_encoder`）
+- `onnx/audio_encoder/model.onnx` ← 第二条（`--component audio_encoder`）
+- `onnx/thinker_prefill/model.onnx` ← 第三条（`--component thinker_prefill`）
+- `onnx/thinker_decode/model.onnx` ← 第四条（`--component thinker_decode`）
+
+> 四个组件也可以一条命令全出：`--component all`（见 5.1）。
 > 想一步到位连导出+验证+端到端+算子汇总+打包全跑完，用 `python run_local_thinking_pipeline.py`（第 4 节）。
 
 ### 5.1 四组件导出
 
 ```bash
-# tiny 模式（随机小权重，接口与官方一致）
-python export_thinking_onnx.py --mode tiny --component all \
-    --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX --force
+# tiny 模式（随机小权重，接口与官方一致）——上面 B 组四条命令的合并版
+python export_thinking_onnx.py --mode tiny --component all --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX --force
 
 # real 模式（官方权重；仅在大内存 Linux 执行，见第 8 节）
-python export_thinking_onnx.py --mode real --component all \
-    --model-path /path/to/Qwen3-Omni-30B-A3B-Thinking \
-    --dtype float16 --device cuda \
-    --minimum-memory-gib 128 \
-    --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX --force
+python export_thinking_onnx.py --mode real --component all --model-path /path/to/Qwen3-Omni-30B-A3B-Thinking --dtype float16 --device cuda --minimum-memory-gib 128 --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX --force
 ```
 
 `--component` 可选 `vision_encoder | audio_encoder | thinker_prefill | thinker_decode | all`。
@@ -158,9 +167,7 @@ python export_thinking_onnx.py --mode real --component all \
 ### 5.2 单模型严格验证
 
 ```bash
-python validate_onnx.py \
-    --case thinker_prefill \
-    --model Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/thinker_prefill/model.onnx
+python validate_onnx.py --case thinker_prefill --model Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/thinker_prefill/model.onnx
 ```
 
 说明：
@@ -182,10 +189,7 @@ python validate_onnx.py --case moe_block --model artifacts/moe_block/model.onnx
 ### 5.3 算子 / 结构检查
 
 ```bash
-python inspect_onnx.py \
-    --model Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/thinker_decode/model.onnx \
-    --output Qwen3-Omni-30B-A3B-Thinking-ONNX/operators/thinker_decode.json \
-    --fail-on-custom-domain
+python inspect_onnx.py --model Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/thinker_decode/model.onnx --output Qwen3-Omni-30B-A3B-Thinking-ONNX/operators/thinker_decode.json --fail-on-custom-domain
 ```
 
 ### 5.4 端到端接力验证

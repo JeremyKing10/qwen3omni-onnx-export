@@ -20,7 +20,7 @@
 3. 显式 KV Cache：Prefill 输出 96 个 K/V；Decode 输入/输出 96 个；**past-sequence 动态轴**；三步自回归续接已验证。
 4. 早期三级回归基线：`rmsnorm`(7) / `moe_block`(33) / `tiny_thinker`(142) 节点。
 5. 完整证据链：哈希绑定、严格 Shape 推导、ORT 数值对比、MoE 双路由覆盖、external data 校验、算子汇总（461 节点 / 41 种标准算子 / 0 自定义 domain）。
-6. 代码审查与修复（4 个真实缺陷，见第 16 节）。
+6. 两轮代码审查与修复：第一轮 4 个真实缺陷，第二轮 15 项（证据安全、real 路径门禁、dtype 契约、容量守卫等，见第 16 节）。
 7. 交付物：`README.md`、`.gitignore`、`requirements.txt`、`scripts/bootstrap.sh`。
 
 **当前产物性质：tiny 接口验证件**（结构与接口同官方一致，权重为随机小配置）。**不得**称为“Qwen3-Omni-30B 实权重 ONNX”。
@@ -1058,6 +1058,8 @@ python -m pip install \
 
 `qwen-omni-utils` 只用于处理真实音频/图像/视频输入，首轮纯文本微型图不需要；进入多模态阶段时再固定版本安装。
 
+> 上面是 Mac 本机历史安装命令，**未包含 `numpy`、`psutil`（`--minimum-memory-gib` 内存门禁依赖它）、`huggingface_hub`**。新机器请以 `requirements.txt` 为准。
+
 Apple Silicon 上不要安装 `flash-attn`。当前便携环境已实际安装并验证：
 
 ```text
@@ -1262,6 +1264,31 @@ external data 文件及大小
 - GitHub 仓库已建立：`https://github.com/JeremyKing10/qwen3omni-onnx-export.git`（main 分支，已提交），并新增 `README.md`、`.gitignore`、`requirements.txt`、`scripts/bootstrap.sh`。
 - 当前实测：四组件合计 461 节点、41 种标准算子、0 个自定义 domain。
 
+### 2026-09-22 第二轮修复（全量代码审查 + 全 md 命令核对）
+
+**代码（本机已实测验证）**
+
+- `validate_onnx.py`：`--case` 传错**不再**覆盖该模型原有的 `validation.json`（此前会毁掉有效证据，已实测复现）；只有 ONNX 哈希不一致才失效化旧报告。
+- `qwen3_omni_thinking_components.py`：
+  - `cu_seqlens` 强制 int32（此前 `.cumsum(0)` 把显式 int32 提升成 int64，导出图实测为 INT64）；
+  - Decode `position_ids` 改为 float32，与 Prefill（官方 `get_rope_index`）一致（此前两图一个 FLOAT 一个 INT64）；
+  - `interface["chunk_count"]` 由实际分块数推导（此前恒写 2）；
+  - real 容量守卫改用与实际 prompt 一致的 `audio_feature_length`，阈值由 `V+A+2` 修正为 `V+A+5`（tiny 实测：旧阈值 8 会放行 8/9/11 这些必然失败的序列长度，真实最小是 12）；
+  - `build_real_thinking_component()` 增加 `assert_transformers_provenance()`。
+- `run_local_thinking_pipeline.py`：新增 `--force` 透传（此前产品目录里若有 real 端到端报告，tiny 流程会中断且无法从一键脚本打开开关）。
+- `export_thinking_onnx.py`：证据失效化挪到 `--force` 检查**之后**且对任意组件生效（实测：不带 `--force` 时退出 1 且证据仍在；带 `--force` 时才失效化）。
+
+**代码（real 路径，本机装不下 59 GiB，仅静态审查）**
+
+- 显存门禁：索引缺 `total_size` 时改为按磁盘分片实际大小估算（此前算出 0 → **静默跳过门禁**）；不再强依赖 `model.safetensors.index.json`；校验 `--device cuda:N` 设备号。
+- `--minimum-memory-gib` 默认 96 → 128；real 的 `--device` 默认是 `cpu`（文档此前误写为默认 cuda）。
+- `validate_thinking_pipeline.py`：`bfloat16` 不再映射成 float32；`--model-path` 支持 `~`；`package_dir` 加工作区/符号链接防护；real 分支增加 CUDA 门禁；CPU EP 遇到 bf16 图直接给出可操作报错（实测：CPU EP 下喂 float32 与喂 `ml_dtypes.bfloat16` 都会被 ORT 拒绝）。
+- `build_thinking_package.py` / `run_real_thinking_pipeline.py`：real 未通过 §9.3 验收判据时以**非 0**退出，不再打印 `[OK]` 误报成功。
+
+**文档**
+
+- 三份 md 里的命令逐条实跑核对；修正：`--case` 使用说明、RMSNorm 打印图的真实输出、失效的 `docs/` 引用、Step 6 三条导出命令缺 `--force`、节点数 462→461 与两个组件哈希、`tools/` 随包快照补 `requirements.txt`、GitHub 地址占位符、bf16/CPU 与 `--device` 默认值说明。
+
 ### 特别注意
 
 - 暂时不要直接执行模型仓库的 Git LFS 克隆，以免意外下载几十 GB 级别的权重。
@@ -1269,6 +1296,7 @@ external data 文件及大小
 - 不要因为导出器生成了文件就认为 MoE 图一定正确。
 - 不要先花大量时间手工整理算子，最终算子清单应从 ONNX 图自动提取。
 - 导出器、Transformers 和模型代码仍可能变化，正式实施时必须记录版本和 commit。
+- **用 ONNX Runtime 的 CPU 后端做验证时，导出精度必须选 `float16`**：bf16 图在 `CPUExecutionProvider` 上无法喂数（工具会直接报错，不会假通过）；只有 CUDA EP 才可能支持。
 
 ---
 

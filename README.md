@@ -37,7 +37,7 @@
 | Audio 层数 / mel | 2 / 20 | 32 / 128 | — |
 | 参数量 | 几万级 | 约 300 亿（A3B 激活） | ~10⁶ 倍 |
 | 权重来源 | **随机初始化** | 官方训练权重 | **本质区别** |
-| 单文件大小 | 约 0.3 MB | 预计 59 GB+ | — |
+| 单文件大小 | 6.6 KB ~ 313 KB（四组件 ONNX 含 external data 合计约 1 MB） | 预计 59 GB+ | — |
 
 **验证过的是什么**：同一输入分别跑 PyTorch 与 ONNX Runtime，输出在浮点误差内一致（实测 1e-8 ~ 1e-11），且 MoE 两种路由都一致、未知 Shape 为 0。这证明**“PyTorch → ONNX 转换”这一步数学等价**。
 
@@ -54,8 +54,9 @@
 ├── portable-export-requirements-lock.txt  # 本机已验证环境的完整 pip freeze 快照（43 行，仅作环境证据，非跨平台安装用）
 ├── scripts/bootstrap.sh             # 一键拉取固定源码 + 建环境
 ├── .gitignore                       # 排除大目录/权重/生成产物
-├── Qwen3_Omni_ONNX_导出工具说明.md   # 详细设计说明（上一版文档）
-├── Qwen3-Omni_ONNX_任务交接说明.md   # 任务背景与决策记录
+├── Qwen3_Omni_ONNX_导出工具说明.md   # 详细设计说明（上一版文档，内容已并入本 README）
+├── Qwen3-Omni_ONNX_任务交接说明.md   # 任务背景、决策记录与接管速览
+├── Qwen3_Omni_ONNX_自检验证报告.md   # 自检证据：核实方案、实际执行输出、反向测试
 ├── qwen3_omni_onnx_cases.py         # 库：tiny 回归模型/路由捕获/哈希工具
 ├── qwen3_omni_thinking_components.py# 库：四组件 Wrapper 与官方 MRoPE 输入构造
 ├── export_onnx.py                   # CLI：早期三级 tiny 回归导出
@@ -413,7 +414,7 @@ GPU 可选但推荐（`--device` 默认是 `cpu`，用 GPU 必须显式传 `--de
 ### 9.2 步骤
 
 ```bash
-git clone https://github.com/<你>/qwen3omni-onnx-export.git
+git clone https://github.com/JeremyKing10/qwen3omni-onnx-export.git
 cd qwen3omni-onnx-export
 bash scripts/bootstrap.sh
 source .venv/bin/activate
@@ -483,6 +484,8 @@ python run_real_thinking_pipeline.py \
 
 ⚠️ 逐个导出只做“导出”这一步，**不会自动生成 manifest / 端到端 / 算子汇总**。必须再跑下面第二段收尾命令，否则拿不到完整产品包。
 
+⚠️ 这里显式传 `--minimum-memory-gib 96` 是**放宽**内存门禁（默认 128）：96–128 GiB 的机器可以用它硬跑，低于 96 GiB 会被直接拒绝；官方权重端到端仍要求 ≥192 GiB。
+
 ```bash
 source .venv/bin/activate
 MODEL=/data/Qwen3-Omni-30B-A3B-Thinking
@@ -526,7 +529,7 @@ git init
 git add .
 git commit -m "qwen3omni onnx export tool: 4-component pipeline + verification"
 git branch -M main
-git remote add origin git@github.com:<你>/qwen3omni-onnx-export.git
+git remote add origin git@github.com:JeremyKing10/qwen3omni-onnx-export.git
 git push -u origin main
 ```
 
@@ -544,8 +547,10 @@ git checkout <commit> -- <file>   # 恢复单个文件
 - **`ModuleNotFoundError`**：所有命令必须在仓库根目录执行（脚本按根目录定位产品包和 artifacts）。
 - **`transformers provenance` 报错**：当前 Python 环境的 transformers 不是固定源码，重新执行 `bash scripts/bootstrap.sh` 或 `pip install -e ./transformers-v5.2.0`。
 - **`--force` 被拒绝**：导出目录必须在 `artifacts/` 的一级子目录内（防误删工作区）。
-- **tiny 验证想覆盖 real 报告**：加 `--force`（工具会显式提示）。
+- **tiny 验证想覆盖 real 报告**：加 `--force`（工具会显式提示）；一键脚本同理：`python run_local_thinking_pipeline.py --force`。
 - **换模型/换 Shape**：改 `qwen3_omni_thinking_components.py` 中的 profile 后必须重跑全部验证，哈希链会自动暴露未重验的产物。
+- **`RuntimeError: ONNX 图含 bfloat16 张量，CPUExecutionProvider 无法执行`**：bf16 图在 ORT 的 CPU 后端跑不起来（喂 float32 / bfloat16 都会被拒）。改用 CUDA EP，或用 `--dtype float16` 重新导出（见 §9.1）。
+- **打包阶段 `status=unverified-real-artifacts` 且退出码非 0**：这是预期行为——没跑端到端就不满足 §9.3 的验收判据。要拿到 `official-weight-components-validated` 必须加 `--run-end-to-end`。
 
 ## 12. 设计决策与实现选择
 

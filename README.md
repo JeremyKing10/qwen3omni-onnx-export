@@ -477,6 +477,7 @@ tiny_thinker → 验证 Attention+RoPE+Mask+MoE+LM Head 组合
 
 ## 13. 参考文档
 
+- `Qwen3_Omni_ONNX_自检验证报告.md`：**凭什么说这套工具有效**——完整核实方案、实际执行输出、反向测试与证据链（想手动复核看这份）
 - `Qwen3-Omni_ONNX_任务交接说明.md`：任务背景、路线决策（标准 ONNX 主线 + NVIDIA 参考线）、接管指南与最新状态（交给另一台机器的 AI 时先读它的第 0 节）
 - `artifacts/real_thinking_metadata/resource_assessment.json`：官方权重规模与本机资源评估证据
 - `Qwen3_Omni_ONNX_导出工具说明.md`：历史设计说明，内容已并入本 README（保留文件仅为兼容旧链接）

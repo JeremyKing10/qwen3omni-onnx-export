@@ -42,6 +42,12 @@ python run_real_thinking_pipeline.py \
   --dtype float16 --device cuda --minimum-memory-gib 128
 ```
 
+补充索引（新接管的 AI 请一并阅读）：
+
+- **tiny 与官方模型的差距对照表** → `README.md` 第 1.1 节（解释为什么当前产物不能叫“官方权重 ONNX”）
+- **大内存机器上的完整命令速查（含“逐个组件导出 + 收尾命令”）** → `README.md` 第 9.4 节
+  - 注意：`--component` 逐个导出**只做导出**，必须再跑 `validate_onnx.py` / `inspect_onnx.py` / `aggregate_operators.py` / `build_thinking_package.py` 才有完整产品包；只有 `run_real_thinking_pipeline.py` 一条龙才自动串好全部步骤。
+
 验收判据（打开 `manifest.json`）：
 
 ```text

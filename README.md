@@ -22,6 +22,29 @@
 
 一句话：**导出方法和验证体系已在真实 Qwen3-Omni 类 + 缩小配置上全链路跑通；剩下唯一一步是在大内存 Linux 上把官方权重灌进同一套流程。**
 
+### 1.1 `tiny` 是什么，与官方模型的差距
+
+`tiny` = **用官方 Qwen3-Omni 的类，配一套很小的尺寸，再用随机权重初始化**。它和官方模型是**同一套代码、同一套算法、同一套算子路径**，唯一区别是**规模与权重值**。
+
+| 维度 | tiny（本机产物） | 官方 30B-A3B-Thinking | 差距 |
+|---|---:|---:|---|
+| 文本层数 | 1 | 48 | 48× |
+| hidden_size | 8 | 2048 | 256× |
+| 注意力头 / KV 头 | 1 / 1 | 32 / 4 | — |
+| MoE 专家数 / top-k | 4 / 2 | 128 / 8 | 32× / 4× |
+| 词表 | 32 | 152064 | 4752× |
+| Vision 深度 | 2 | 27 | 13.5× |
+| Audio 层数 / mel | 2 / 20 | 32 / 128 | — |
+| 参数量 | 几万级 | 约 300 亿（A3B 激活） | ~10⁶ 倍 |
+| 权重来源 | **随机初始化** | 官方训练权重 | **本质区别** |
+| 单文件大小 | 约 0.3 MB | 预计 59 GB+ | — |
+
+**验证过的是什么**：同一输入分别跑 PyTorch 与 ONNX Runtime，输出在浮点误差内一致（实测 1e-8 ~ 1e-11），且 MoE 两种路由都一致、未知 Shape 为 0。这证明**“PyTorch → ONNX 转换”这一步数学等价**。
+
+**没有验证的是什么**：模型输出是否有语义。随机权重不携带任何知识，tiny 产物**不能**用来做真实推理，只能用于验证导出接口、图结构、算子与验证链路。
+
+类比：现在造好了编译器并用 hello-world 证明编译器正确；最终目标是用它编译出那个 300 亿参数的正式程序——缺的就是把官方权重灌进去。
+
 ## 2. 目录结构
 
 ```text
@@ -247,6 +270,70 @@ end_to_end_validation_passed = true       # real 端到端 3 步 Decode 通过�
 ```
 
 任一条件不满足时 status 会是 `unverified-real-artifacts` 或 `tiny-interface-validation-only`，此时不得对外宣称是“官方权重 ONNX”。
+
+### 9.4 完整命令速查（照抄即可，注意两种内存档位）
+
+**档位 A：内存 ≥128 GiB —— 一条命令得到最终产品**
+
+`run_real_thinking_pipeline.py` 内部已经串好了全部步骤（导出 → 逐组件 validate → 逐组件 inspect → 算子汇总 → 打包），**不需要再手动补任何命令**：
+
+```bash
+source .venv/bin/activate
+MODEL=/data/Qwen3-Omni-30B-A3B-Thinking
+OUT=Qwen3-Omni-30B-A3B-Thinking-ONNX
+
+# 有 GPU
+python run_real_thinking_pipeline.py \
+  --model-path "$MODEL" --dtype float16 --device cuda \
+  --minimum-memory-gib 128
+
+# 无 GPU
+python run_real_thinking_pipeline.py \
+  --model-path "$MODEL" --dtype bfloat16 --device cpu \
+  --minimum-memory-gib 128
+
+# 内存 ≥192 GiB 时，追加官方权重端到端验证（三步 Decode）
+python run_real_thinking_pipeline.py \
+  --model-path "$MODEL" --run-end-to-end --minimum-memory-gib 128
+```
+
+**档位 B：内存 96–128 GiB —— 逐个组件导出（必须补收尾命令）**
+
+⚠️ 逐个导出只做“导出”这一步，**不会自动生成 manifest / 端到端 / 算子汇总**。必须再跑下面第二段收尾命令，否则拿不到完整产品包。
+
+```bash
+source .venv/bin/activate
+MODEL=/data/Qwen3-Omni-30B-A3B-Thinking
+OUT=Qwen3-Omni-30B-A3B-Thinking-ONNX
+
+# ① 逐个导出（四个进程，各自重新加载一次权重，慢但峰值低）
+for c in vision_encoder audio_encoder thinker_prefill thinker_decode; do
+  python export_thinking_onnx.py --mode real --component "$c" \
+    --model-path "$MODEL" --dtype float16 --device cuda \
+    --minimum-memory-gib 96 --package-dir "$OUT" --force
+done
+
+# ② 收尾：逐组件验证 + 算子检查（缺一不可）
+for c in vision_encoder audio_encoder thinker_prefill thinker_decode; do
+  python validate_onnx.py --model "$OUT/onnx/$c/model.onnx"
+  python inspect_onnx.py --model "$OUT/onnx/$c/model.onnx" \
+    --output "$OUT/operators/${c%_encoder}.json" --fail-on-custom-domain
+done
+
+# ③ 收尾：端到端接力（可选，内存 ≥192 GiB 时跑）+ 算子汇总 + 打包
+python validate_thinking_pipeline.py --mode real --model-path "$MODEL" \
+  --package-dir "$OUT" --force
+python aggregate_operators.py --package-dir "$OUT"
+python build_thinking_package.py --package-dir "$OUT" \
+  --source-dir "$MODEL" --offline
+```
+
+完成后检查：
+
+```bash
+grep -E '"status"|official_weights_included|shared_checkpoint_fingerprint|source_equivalence_passed|end_to_end_validation_passed' \
+  "$OUT/manifest.json"
+```
 
 ## 10. 版本管理（GitHub）
 

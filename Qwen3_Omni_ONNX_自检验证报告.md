@@ -124,7 +124,7 @@ e2e passed: True | decode_steps: 3
   decode_step_2    outputs= 3 all_passed=True
   decode_step_3    outputs= 3 all_passed=True
 
-nodes: 462 | ops: 41
+nodes: 461 | ops: 41
 ```
 
 端到端每一步的最大绝对误差：

@@ -62,8 +62,23 @@ ORT_DTYPE_MAP = {
 }
 
 
-def cast_feed(session: ort.InferenceSession, feed: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+def ensure_feed_dtype_supported(session: ort.InferenceSession, provider: str) -> None:
+    """ORT 的 CPUExecutionProvider 无法消费 bfloat16 张量：喂 float32 被拒、喂 ml_dtypes.bfloat16 也被拒。"""
+    if provider != "CPUExecutionProvider":
+        return
+    declared = {item.type for item in (*session.get_inputs(), *session.get_outputs())}
+    if "tensor(bfloat16)" in declared:
+        raise RuntimeError(
+            "ONNX 图含 bfloat16 张量，CPUExecutionProvider 无法执行（实测：喂 float32 与喂 ml_dtypes.bfloat16 "
+            "都会被 ORT 拒绝）。请改用 CUDAExecutionProvider，或用 --dtype float16 重新导出后再验证。"
+        )
+
+
+def cast_feed(
+    session: ort.InferenceSession, feed: dict[str, np.ndarray], provider: str
+) -> dict[str, np.ndarray]:
     """Cast each feed array to the dtype declared by the corresponding graph input."""
+    ensure_feed_dtype_supported(session, provider)
     casted: dict[str, np.ndarray] = {}
     for item in session.get_inputs():
         value = feed[item.name]
@@ -79,6 +94,7 @@ def run_ort(
     provider: str,
 ) -> tuple[np.ndarray, ...]:
     session = ort.InferenceSession(str(model_path), providers=[provider])
+    ensure_feed_dtype_supported(session, provider)
     feed = {name: tensor_to_numpy(tensor) for name, tensor in zip(names, tensors)}
     output_names = [item.name for item in session.get_outputs()]
     return tuple(session.run(output_names, feed))
@@ -219,7 +235,11 @@ def main() -> None:
     for name, value in zip(prefill_case.input_names[7:], vision_ort[1:]):
         prefill_feed[name] = value
     prefill_output_names = [item.name for item in prefill_session.get_outputs()]
-    prefill_ort = tuple(prefill_session.run(prefill_output_names, cast_feed(prefill_session, prefill_feed)))
+    prefill_ort = tuple(
+        prefill_session.run(
+            prefill_output_names, cast_feed(prefill_session, prefill_feed, args.provider)
+        )
+    )
 
     del prefill_session
     device = prefill_template[0].device
@@ -250,7 +270,11 @@ def main() -> None:
         }
         for name, value in zip(decode_case.input_names[4:], ort_cache):
             decode_feed[name] = value
-        decode_ort = tuple(decode_session.run(decode_output_names, cast_feed(decode_session, decode_feed)))
+        decode_ort = tuple(
+            decode_session.run(
+                decode_output_names, cast_feed(decode_session, decode_feed, args.provider)
+            )
+        )
         decode_comparisons[f"decode_step_{step + 1}"] = compare_outputs(
             decode_ort,
             decode_pt,

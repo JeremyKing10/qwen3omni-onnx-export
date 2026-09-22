@@ -24,6 +24,7 @@ PROCESSOR_FILES = (
 )
 ROOT_CONFIG_FILES = ("config.json", "generation_config.json")
 TOOL_FILES = (
+    "requirements.txt",
     "qwen3_omni_onnx_cases.py",
     "qwen3_omni_thinking_components.py",
     "export_onnx.py",

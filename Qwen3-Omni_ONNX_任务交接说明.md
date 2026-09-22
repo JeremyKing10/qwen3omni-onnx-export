@@ -19,7 +19,7 @@
 2. 四组件正式导出链路：`vision_encoder`、`audio_encoder`、`thinker_prefill`、`thinker_decode`。
 3. 显式 KV Cache：Prefill 输出 96 个 K/V；Decode 输入/输出 96 个；**past-sequence 动态轴**；三步自回归续接已验证。
 4. 早期三级回归基线：`rmsnorm`(7) / `moe_block`(33) / `tiny_thinker`(142) 节点。
-5. 完整证据链：哈希绑定、严格 Shape 推导、ORT 数值对比、MoE 双路由覆盖、external data 校验、算子汇总（462 节点 / 41 种标准算子 / 0 自定义 domain）。
+5. 完整证据链：哈希绑定、严格 Shape 推导、ORT 数值对比、MoE 双路由覆盖、external data 校验、算子汇总（461 节点 / 41 种标准算子 / 0 自定义 domain）。
 6. 代码审查与修复（4 个真实缺陷，见第 16 节）。
 7. 交付物：`README.md`、`.gitignore`、`requirements.txt`、`scripts/bootstrap.sh`。
 
@@ -1260,7 +1260,7 @@ external data 文件及大小
 - 产品包与证据链已完成：`manifest.json`、`validation/end_to_end.json`、`operators/summary.json + all_operators.csv`、`test_data/`、`tools/` 快照。
 - 全量回归 + 代码审查已完成，修复 4 个真实缺陷：real 导出前误删旧证据、real fp16 端到端 dtype 不匹配、tiny 覆盖 real 端到端报告、`--source-dir` config 未做 checkpoint 指纹校验。
 - GitHub 仓库已建立：`https://github.com/JeremyKing10/qwen3omni-onnx-export.git`（main 分支，已提交），并新增 `README.md`、`.gitignore`、`requirements.txt`、`scripts/bootstrap.sh`。
-- 当前实测：四组件合计 462 节点、41 种标准算子、0 个自定义 domain。
+- 当前实测：四组件合计 461 节点、41 种标准算子、0 个自定义 domain。
 
 ### 特别注意
 

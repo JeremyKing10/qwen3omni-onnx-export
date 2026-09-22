@@ -406,6 +406,7 @@ print('outputs:', [(v.name, [d.dim_value for d in v.type.tensor_type.shape.dim])
 Linux x86_64，≥128 GiB RAM（导出四组件；端到端验证建议 ≥192 GiB）
 磁盘 ≥200 GiB（权重 59.08 GiB + ONNX external data + 中间产物）
 GPU 可选但推荐（`--device` 默认是 `cpu`，用 GPU 必须显式传 `--device cuda`；此时脚本会按权重总量 1.2× 检查可用显存）
+精度：`--dtype float16` 或 `bfloat16`；**用 CPU 做 ONNX Runtime 验证时必须选 `float16`**——bf16 图在 `CPUExecutionProvider` 上跑不起来（ORT 会拒绝喂数），只有 CUDA EP 才可能支持。选错时 `validate_thinking_pipeline.py` 会明确报错
 `--minimum-memory-gib` 默认 128（real 模式物理内存保护线，低于该值直接拒绝执行）
 ```
 
@@ -467,8 +468,10 @@ python run_real_thinking_pipeline.py \
   --minimum-memory-gib 128
 
 # 无 GPU
+# 注意：无 GPU 时必须用 float16。bfloat16 图无法被 ORT 的 CPUExecutionProvider 执行
+# （实测喂 float32 与 ml_dtypes.bfloat16 都会被拒绝），工具会直接报错而不是给出假的通过。
 python run_real_thinking_pipeline.py \
-  --model-path "$MODEL" --dtype bfloat16 --device cpu \
+  --model-path "$MODEL" --dtype float16 --device cpu \
   --minimum-memory-gib 128
 
 # 内存 ≥192 GiB 时，追加官方权重端到端验证（三步 Decode）

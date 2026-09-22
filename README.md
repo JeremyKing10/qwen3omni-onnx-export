@@ -50,7 +50,8 @@
 ```text
 .
 ├── README.md                        # 本文件
-├── requirements.txt                 # 依赖清单（已验证版本）
+├── requirements.txt                 # 新机器安装用的可移植依赖清单（跨平台）
+├── portable-export-requirements-lock.txt  # 本机已验证环境的完整 pip freeze 快照（43 行，仅作环境证据，非跨平台安装用）
 ├── scripts/bootstrap.sh             # 一键拉取固定源码 + 建环境
 ├── .gitignore                       # 排除大目录/权重/生成产物
 ├── Qwen3_Omni_ONNX_导出工具说明.md   # 详细设计说明（上一版文档）
@@ -83,6 +84,15 @@ source .venv/bin/activate
 脚本做四件事：拉取并固定 `transformers v5.2.0`（commit `7d9754a0…`）、可选拉取两个参考仓库、创建 `.venv` 并按 `requirements.txt` 装依赖、最后校验 `transformers.__file__` 确实来自固定源码目录（防止误用 PyPI wheel，源头不可复现）。
 
 Linux + CUDA 的 torch 安装请参考 pytorch.org 选择对应 wheel 后再跑 bootstrap（或先装 torch 再 `pip install -r requirements.txt`）。
+
+### 3.1 `requirements.txt` 与 `portable-export-requirements-lock.txt` 的区别
+
+| 文件 | 是什么 | 怎么用 |
+|---|---|---|
+| `requirements.txt` | **可移植安装清单**：只锁关键包版本（torch / onnx / onnxruntime / onnxscript / accelerate / safetensors …），不绑死平台 | 新机器一律用它：`pip install -r requirements.txt`；Linux + CUDA 先按 pytorch.org 装好 torch 再装 |
+| `portable-export-requirements-lock.txt` | **本机已验证环境的完整快照**：`pip freeze` 的全部 43 行，包含所有传递依赖（certifi、click、filelock、flatbuffers……），其中 torch 是 **macOS arm64 wheel** | **只作环境证据/审计**，不要拿到 Linux 上 `pip install -r`（平台 wheel 不匹配会直接失败）。它被 `build_thinking_package.py` 复制进产品包 `tools/`，作为“这个 ONNX 是在什么环境里产出的”的不可篡改证据 |
+
+简单记：**装环境用 `requirements.txt`；留证据用 lock 文件。**
 
 ## 4. 快速开始（无需下载任何权重，约 1 分钟）
 
@@ -181,6 +191,43 @@ python inspect_onnx.py  --model artifacts/moe_block/model.onnx --fail-on-custom-
 | `thinker_decode` | `input_ids [B,1]`、`attention_mask [B,past+1]`、`position_ids`、`cache_position`、`past_key/value_0..47` | `logits [B,1,V]` + `present_key/value_0..47` | **past-sequence 为动态轴**；自回归时把本步 96 个输出直接回灌为下步输入 |
 
 宿主程序负责：tokenizer 与媒体预处理、多模态占位与位置计算、自回归循环/采样/停止条件、prefill→decode 的 KV 交接。这些是 Python 控制流，不适合也不应该塞进单个 ONNX。
+
+### 6.1 三部分权重、四张 ONNX 图
+
+官方 checkpoint 里这三部分权重**命名空间互相独立**，可以分别导出：
+
+| 权重命名空间 | 对应 ONNX | 说明 |
+|---|---|---|
+| `thinker.visual.*` | `vision_encoder/model.onnx` | 视觉编码器（ViT + DeepStack merger） |
+| `thinker.audio_tower.*` | `audio_encoder/model.onnx` | 音频编码器（Conv + Transformer + projection） |
+| `thinker.model.*` + `thinker.lm_head.*` | `thinker_prefill/model.onnx` **和** `thinker_decode/model.onnx` | **同一份文本权重，导出成两张图**（prefill 与 decode 只是输入输出形态不同） |
+
+因此是 **3 组权重 → 4 张 ONNX 图**。
+
+每个组件都有自己的**独立算子报告**，不需要跑完四个才有清单：
+
+```text
+operators/vision.json           vision_encoder 的算子清单
+operators/audio.json            audio_encoder 的算子清单
+operators/thinker_prefill.json  prefill 图的算子清单
+operators/thinker_decode.json   decode 图的算子清单
+operators/all_operators.csv     汇总（带 Component 列，可按组件筛选）
+operators/summary.json          各组件节点数 + 全局唯一算子
+```
+
+也可以只导出其中一部分（`--component vision_encoder`）。
+
+⚠️ **当前限制**：`load_real_thinking_model()` 会**整体加载** checkpoint（约 59 GiB），即使只导 `vision_encoder` 也要先把全量权重装进内存——这正是本机 48 GiB 无法执行的原因。若要在小内存机器上只导视觉/音频，需要“按 key 选择性加载”的增强（见第 8 节局限性）。
+
+### 6.2 tiny 尺寸定义在哪些代码里
+
+| 配置 | 文件 | 函数 | 行 |
+|---|---|---|---|
+| 文本（tiny） | `qwen3_omni_onnx_cases.py` | `make_tiny_text_config()` | 101 |
+| 视觉（tiny） | `qwen3_omni_thinking_components.py` | `make_tiny_vision_config()` | 268 |
+| 音频（tiny） | `qwen3_omni_thinking_components.py` | `make_tiny_audio_config()` | 304 |
+| 组合（tiny） | `qwen3_omni_thinking_components.py` | `make_tiny_thinker_config()` | 287 |
+| 官方真实尺寸 | `artifacts/real_thinking_metadata/config.json` | — | — |
 
 ## 7. 如何自证导出正确（自检体系）
 

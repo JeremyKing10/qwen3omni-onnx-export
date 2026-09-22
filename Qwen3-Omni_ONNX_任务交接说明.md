@@ -83,6 +83,82 @@ for c in rmsnorm moe_block tiny_thinker; do python validate_onnx.py --case $c --
 | Thinking checkpoint revision | `2f443cfc4c54b14a815c0e2bb9a9d6cbcd9a8…` 完整值 `2f443cfc4c54b14a815c0e2bb9a9d6cbcd9a748b` |
 | Python / PyTorch / ONNX / ORT | 3.11.9 / 2.8.0 / 1.22.0 / 1.30.0 |
 
+### 0.7 新机器环境准备（虚拟环境 / 依赖 / 固定源码）
+
+> 第 14 节 Step 3 记录的是 **Mac 本机历史步骤**（含 macOS 绝对路径），新机器请按本节操作。
+
+**推荐：一条命令**（自动完成建 venv、装依赖、拉固定源码、校验来源）：
+
+```bash
+git clone https://github.com/JeremyKing10/qwen3omni-onnx-export.git
+cd qwen3omni-onnx-export
+bash scripts/bootstrap.sh      # 需要 python3.11；可用 PYTHON_BIN=/path/to/python3.11 指定
+source .venv/bin/activate
+```
+
+`bootstrap.sh` 实际做的事：
+
+```text
+1. 检查 python3.11
+2. 若缺 transformers-v5.2.0 → 浅克隆 v5.2.0 并 checkout 固定 commit 7d9754a0…
+3. 克隆两个可选参考仓库（失败只告警，不影响导出）
+4. 创建 .venv → pip install -r requirements.txt → pip install -e ./transformers-v5.2.0
+5. 校验 transformers.__file__ 来自固定源码
+```
+
+**手动方式**（想自己控制每一步时）：
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip setuptools wheel
+python -m pip install -r requirements.txt
+python -m pip install -e ./transformers-v5.2.0     # 必须 editable 安装固定源码，不能装 PyPI transformers
+```
+
+**依赖清单**（`requirements.txt`）：
+
+```text
+torch==2.8.0            # Linux+CUDA 请先按 pytorch.org 装 CUDA 版，版本同为 2.8.0
+accelerate==1.15.0
+safetensors==0.8.0
+huggingface_hub>=0.34
+onnx==1.22.0
+onnxruntime==1.30.0
+onnxscript==0.7.2
+numpy>=2.0
+psutil>=5.9
+```
+
+Linux + CUDA 示例（先装 torch 再跑 bootstrap，避免被 CPU 版覆盖）：
+
+```bash
+python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+bash scripts/bootstrap.sh
+```
+
+**装完必做的两项验证**：
+
+```bash
+python -c "from qwen3_omni_onnx_cases import assert_transformers_provenance as f; print(f())"
+python -c "import torch, transformers, onnx, onnxruntime as o; print(torch.__version__, transformers.__version__, onnx.__version__, o.__version__)"
+```
+
+期望输出：
+
+```text
+{'imported_file': '.../transformers-v5.2.0/src/transformers/__init__.py', 'revision': '7d9754a05193eb79b1d86aa744b622b8068008cd'}
+2.8.0 5.2.0 1.22.0 1.30.0
+```
+
+最后跑一次无权重全链路确认环境可用：
+
+```bash
+python run_local_thinking_pipeline.py
+```
+
+> 注意：如果 `assert_transformers_provenance()` 报错，说明当前环境的 `transformers` 不是固定源码（例如误装了 PyPI 版），导出工具会在每次导出前拒绝执行，这是刻意设计，不要绕过。
+
 ---
 
 ## 1. 任务背景
@@ -947,6 +1023,8 @@ git -C TensorRT-Edge-LLM-v0.10.1 checkout --detach e8b29522938901f6df19ebeedd4b6
 ```
 
 ### Step 3：创建便携导出环境（已完成）
+
+> **本节是 Mac 本机历史记录**（含 `/Users/bojunjin/.workbuddy/...` 等 macOS 绝对路径）。**新机器请直接看第 0.7 节**（`scripts/bootstrap.sh` + `requirements.txt`），不要照抄本节路径。
 
 当前系统 Python 3.9.6 不用作项目环境，且当前机器没有 Conda、Mamba、Homebrew、pyenv 或 uv。已安装独立 Python 3.11.9，可直接创建工作区虚拟环境：
 

@@ -278,8 +278,55 @@ git checkout <commit> -- <file>   # 恢复单个文件
 - **tiny 验证想覆盖 real 报告**：加 `--force`（工具会显式提示）。
 - **换模型/换 Shape**：改 `qwen3_omni_thinking_components.py` 中的 profile 后必须重跑全部验证，哈希链会自动暴露未重验的产物。
 
-## 12. 参考文档
+## 12. 设计决策与实现选择
 
-- `Qwen3_Omni_ONNX_导出工具说明.md`：设计细节、数据流、tiny 阶段实验记录
-- `Qwen3-Omni_ONNX_任务交接说明.md`：任务背景、路线决策（标准 ONNX 主线 + NVIDIA 参考线）、风险分析
+以下内容来自早期设计文档的精华，已并入本 README（`Qwen3_Omni_ONNX_导出工具说明.md` 仅保留为历史指针）。
+
+### 12.1 为什么不用原始 eager Experts 循环
+
+Qwen3-Omni 原始 MoE 专家计算会根据输入的路由结果执行 Python 循环：
+
+```text
+one_hot → nonzero → for expert_idx → where → index_add_
+```
+
+这含数据相关 Python 控制流，传统 tracing 极易只固化示例输入命中的专家，导致“导出成功但换输入就错”。
+
+Transformers v5.2.0 自带等价的可切换实现 `experts_implementation="batched_mm"`：
+
+```text
+TopK indices → Gather 对应专家权重 → batched MatMul → 路由权重 → reshape + ReduceSum
+```
+
+本工具使用官方提供的这一实现，**不是自行改写模型数学定义**；这样得到的图只含标准 ONNX 算子，且路由随输入动态变化（已用两组不同路由验证）。
+
+### 12.2 为什么 KV Cache 必须显式展平
+
+Transformers 的 `DynamicCache` 是 Python 对象，不能作为 ONNX 公共接口。因此：
+
+- `thinker_prefill` 输出 **96 个显式张量**（`present_key/value_0..47`）
+- `thinker_decode` 输入/输出同样 96 个（`past_*` / `present_*`）
+- 自回归时把本步 96 个输出直接喂回下一步的 96 个输入
+- past-sequence 是唯一动态轴，其余维度固定
+
+### 12.3 为什么要拆成四个组件而不是一个图
+
+Qwen3-Omni 完整链路含 tokenizer、媒体文件读取、grid/分块预处理、自回归循环、采样停止条件、可选模态分支，这些都是 Python 控制流。ONNX 适合表达“一次张量前向”，不适合表达完整应用。因此产品是**四个神经网络组件 + 宿主调度程序**，而不是单个 ONNX。
+
+### 12.4 早期三级回归模型的定位
+
+`rmsnorm`（7 节点）/ `moe_block`（33）/ `tiny_thinker`（142）是**单元测试级**产物：
+
+```text
+rmsnorm      → 验证导出环境、Checker、ORT、归一化算子
+moe_block    → 专项验证 MoE 动态路由（最关键风险）
+tiny_thinker → 验证 Attention+RoPE+Mask+MoE+LM Head 组合
+```
+
+它们与四组件是**回归基线关系**：改动正式导出代码后先跑这三个，能快速定位是环境问题还是组件问题。
+
+## 13. 参考文档
+
+- `Qwen3-Omni_ONNX_任务交接说明.md`：任务背景、路线决策（标准 ONNX 主线 + NVIDIA 参考线）、接管指南与最新状态（交给另一台机器的 AI 时先读它的第 0 节）
 - `artifacts/real_thinking_metadata/resource_assessment.json`：官方权重规模与本机资源评估证据
+- `Qwen3_Omni_ONNX_导出工具说明.md`：历史设计说明，内容已并入本 README（保留文件仅为兼容旧链接）

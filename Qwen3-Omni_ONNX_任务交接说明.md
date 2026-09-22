@@ -1,5 +1,90 @@
 # Qwen3-Omni ONNX 导出与编译器验证任务交接说明
 
+## 0. 接管前必读（2026-09-22 最新状态）
+
+> 把本文档交给另一台机器上的 AI 时，**请让它先读完第 0 节再看其他章节**。第 1～15 节是历史决策与过程记录，部分步骤标注已过期；第 16 节以后是状态。最新、最准确的操作说明在 `README.md`。
+
+### 0.1 任务定义（已更新）
+
+- 目标：把 `Qwen3-Omni-30B-A3B-Thinking`（多模态输入 → 文本输出）导出为**只含标准 ONNX 算子**的组件级 ONNX 产品，并给出算子清单与可复现验证。
+- **自研编译器已不在交付范围**：只需交付 ONNX 产品 + 算子清单 + 验证证据。
+- 代码仓库（已提交 main 分支）：`https://github.com/JeremyKing10/qwen3omni-onnx-export.git`
+- 本机工作目录：`/Users/bojunjin/Documents/LLM/qwen3-omni-onnx-work`
+
+### 0.2 当前真实进度
+
+已完成：
+
+1. 固定源码与环境（Transformers v5.2.0 commit `7d9754a0…`、Python 3.11.9、PyTorch 2.8.0、ONNX 1.22.0、ORT 1.30.0）。
+2. 四组件正式导出链路：`vision_encoder`、`audio_encoder`、`thinker_prefill`、`thinker_decode`。
+3. 显式 KV Cache：Prefill 输出 96 个 K/V；Decode 输入/输出 96 个；**past-sequence 动态轴**；三步自回归续接已验证。
+4. 早期三级回归基线：`rmsnorm`(7) / `moe_block`(33) / `tiny_thinker`(142) 节点。
+5. 完整证据链：哈希绑定、严格 Shape 推导、ORT 数值对比、MoE 双路由覆盖、external data 校验、算子汇总（462 节点 / 41 种标准算子 / 0 自定义 domain）。
+6. 代码审查与修复（4 个真实缺陷，见第 16 节）。
+7. 交付物：`README.md`、`.gitignore`、`requirements.txt`、`scripts/bootstrap.sh`。
+
+**当前产物性质：tiny 接口验证件**（结构与接口同官方一致，权重为随机小配置）。**不得**称为“Qwen3-Omni-30B 实权重 ONNX”。
+
+### 0.3 唯一阻塞与下一步
+
+- 阻塞：官方权重 59.08 GiB > 本机 48 GiB 内存；工具用 `--minimum-memory-gib` 门禁强制拦截，不会假成功。
+- 下一步（在 ≥128 GiB Linux 上执行，详见 `README.md` 第 9 节）：
+
+```bash
+git clone https://github.com/JeremyKing10/qwen3omni-onnx-export.git
+cd qwen3omni-onnx-export && bash scripts/bootstrap.sh && source .venv/bin/activate
+python run_local_thinking_pipeline.py          # 先验环境（无需权重）
+hf download Qwen/Qwen3-Omni-30B-A3B-Thinking \
+  --revision 2f443cfc4c54b14a815c0e2bb9a9d6cbcd9a748b \
+  --local-dir /data/Qwen3-Omni-30B-A3B-Thinking
+python run_real_thinking_pipeline.py \
+  --model-path /data/Qwen3-Omni-30B-A3B-Thinking \
+  --dtype float16 --device cuda --minimum-memory-gib 128
+```
+
+验收判据（打开 `manifest.json`）：
+
+```text
+status                          = official-weight-components-validated
+official_weights_included       = true
+shared_checkpoint_fingerprint   = true
+source_equivalence_passed       = true
+end_to_end_validation_passed    = true
+```
+
+### 0.4 一键自检（任何机器改代码后必跑）
+
+```bash
+source .venv/bin/activate
+python -m py_compile *.py
+python -c "from qwen3_omni_onnx_cases import assert_transformers_provenance as f; print(f())"
+python run_local_thinking_pipeline.py
+for c in rmsnorm moe_block tiny_thinker; do python validate_onnx.py --case $c --model artifacts/$c/model.onnx; done
+```
+
+全部 `[OK]` 才算通过；反向测试（改 1 字节 ONNX / `--atol inf` / `--force` 越界）应分别被哈希链、容差校验、路径防护拦截。
+
+### 0.5 禁止事项
+
+- 不要把当前 tiny ONNX 说成官方权重 ONNX。
+- 不要用降低容差、`--atol inf`、绕过哈希等方式把验证“变绿”。
+- 不要用磁盘 offload 在本机强行加载 59 GiB 权重。
+- 不要导出 `generate()` 或试图把整个 Python 应用塞进一个 ONNX。
+- 不要再次重组织工作区文件路径结构（此前做过一次并已按用户要求完整回退；现在所有脚本都在根目录，靠 `WORKSPACE` 定位）。
+- 不要提交权重、`.venv`、三个第三方源码克隆到 Git（`.gitignore` 已排除）。
+
+### 0.6 固定版本表
+
+| 项目 | 值 |
+|---|---|
+| Transformers | v5.2.0，commit `7d9754a05193eb79b1d86aa744b622b8068008cd` |
+| Qwen3-Omni 官方仓库 | commit `e4235853125589c789f06a2dd83e9f4126df5e9d` |
+| NVIDIA 参考仓库 | v0.10.1，commit `e8b29522938901f6df19ebeedd4b69bc8edbcd97` |
+| Thinking checkpoint revision | `2f443cfc4c54b14a815c0e2bb9a9d6cbcd9a8…` 完整值 `2f443cfc4c54b14a815c0e2bb9a9d6cbcd9a748b` |
+| Python / PyTorch / ONNX / ORT | 3.11.9 / 2.8.0 / 1.22.0 / 1.30.0 |
+
+---
+
 ## 1. 任务背景
 
 原始任务反馈为：
@@ -958,7 +1043,7 @@ KV Cache = 是否要求
 
 没有反馈时按阶段 0 默认值推进，但不能在最终报告里把默认值写成编译器事实。
 
-### Step 6：建立微型导出与验证闭环（当前下一步）
+### Step 6：建立微型导出与验证闭环（已完成；现由 `run_local_thinking_pipeline.py` 一键执行）
 
 先实现三个本地共享工具：
 
@@ -1075,14 +1160,22 @@ external data 文件及大小
 
 ### 当前尚未完成
 
-- 尚未取得自研编译器的 opset、dtype、external data、动态 Shape、执行命令和目标运行平台等约束。
-- 未确认模型权重是否可访问，也未下载权重。
+- **官方 30B 权重的四组件 ONNX 尚未导出**：唯一阻塞是本机 48 GiB 内存 < 59.08 GiB 权重，需迁移到 ≥128 GiB Linux 机器（README 第 9 节）。
+- 尚未在官方权重上跑端到端三步 Decode（同样受内存限制）。
+- 未提供“单个 ONNX 文件”形态（当前产品是四组件 + 宿主调度；如有硬性单文件需求需新增导出模式）。
+- 语音输出组件（Talker / CodePredictor / Code2Wav）未实现（Thinking checkpoint 本身无语音链路）。
 - 未运行 Optimum 支持性快速测试；该测试不是主线阻塞项。
-- 未编写 Qwen3-Omni 组件的 ONNX 导出包装器和验证脚本。
-- 尚未生成 Qwen3-Omni 组件 ONNX；仅生成并在测试后删除了基础冒烟 ONNX。
-- 未对 Qwen3-Omni 组件进行 ONNX Runtime 数值校验。
-- 未生成真实算子统计。
-- 未运行自研编译器。
+- 自研编译器相关约束已不在本任务交付范围（如后续需要，再做算子支持矩阵映射即可）。
+
+### 2026-09-22 追加完成
+
+- 四组件正式导出链路已完成并通过验证：`vision_encoder`、`audio_encoder`、`thinker_prefill`、`thinker_decode`。
+- 显式 KV Cache 已完成：Prefill 输出 96 个 K/V，Decode 输入输出 96 个，并支持**动态 past-sequence** 与三步自回归续接。
+- 早期三级回归（rmsnorm / moe_block / tiny_thinker）已并入回归基线。
+- 产品包与证据链已完成：`manifest.json`、`validation/end_to_end.json`、`operators/summary.json + all_operators.csv`、`test_data/`、`tools/` 快照。
+- 全量回归 + 代码审查已完成，修复 4 个真实缺陷：real 导出前误删旧证据、real fp16 端到端 dtype 不匹配、tiny 覆盖 real 端到端报告、`--source-dir` config 未做 checkpoint 指纹校验。
+- GitHub 仓库已建立：`https://github.com/JeremyKing10/qwen3omni-onnx-export.git`（main 分支，已提交），并新增 `README.md`、`.gitignore`、`requirements.txt`、`scripts/bootstrap.sh`。
+- 当前实测：四组件合计 462 节点、41 种标准算子、0 个自定义 domain。
 
 ### 特别注意
 
@@ -1096,4 +1189,4 @@ external data 文件及大小
 
 ## 17. 一句话交接结论
 
-三套源码、Python 3.11 便携环境和基础 ONNX 冒烟测试现已完成；当前先实现统一的导出、验证和检查 CLI，再严格按“基础层 → 单个真实 MoE Block → 小配置 Thinker Text”完成本地标准 ONNX 闭环。之后才下载固定 revision 的 Thinking 权重并导出 Thinker Text + LM Head。编译器信息并行收集，信息到齐后补跑编译闭环；NVIDIA Instruct 六组件路线仅作拆分和图改写对照。
+三套源码、Python 3.11 环境和四组件 ONNX 导出链路现已全部完成并通过验证（含动态 KV Cache 与三步 Decode）。当前唯一阻塞是官方权重 59.08 GiB 超过本机 48 GiB 内存；迁移到 ≥128 GiB Linux 后按 `README.md` 第 9 节执行 `run_real_thinking_pipeline.py` 即可产出官方权重产品，并以 `manifest.json` 的 `official-weight-components-validated` 作为最终验收。完整操作说明以 `README.md` 为准，本文档第 0 节为接管速览。

@@ -182,7 +182,7 @@ python validate_onnx.py --case thinker_prefill --model Qwen3-Omni-30B-A3B-Thinki
 # 不传 --case（推荐，最不容易出错）
 python validate_onnx.py --model Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/thinker_decode/model.onnx
 
-# 早期回归必须传 --case（因为 artifacts 下的模型没有组件元数据）
+# artifacts 下的早期回归模型同样可以不传 --case（目录里也有 export_metadata.json）
 python validate_onnx.py --case moe_block --model artifacts/moe_block/model.onnx
 ```
 
@@ -198,7 +198,7 @@ python inspect_onnx.py --model Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/thinker_dec
 python validate_thinking_pipeline.py --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX
 ```
 
-real 模式追加 `--mode real --model-path ... --provider CUDAExecutionProvider`；覆盖不同模式的旧报告需显式 `--force`（防止 tiny 证据覆盖 real 证据）。
+real 模式追加 `--mode real --model-path ... --provider CUDAExecutionProvider`；覆盖不同模式的旧报告需显式 `--force`（防止 tiny 证据覆盖 real 证据）。一键脚本同理：产品目录里若已有 real 报告，`python run_local_thinking_pipeline.py` 会被拒绝，需 `python run_local_thinking_pipeline.py --force`。
 
 ### 5.5 算子汇总与打包
 
@@ -217,7 +217,7 @@ python export_onnx.py --case moe_block    --output-dir artifacts/moe_block    --
 python export_onnx.py --case tiny_thinker --output-dir artifacts/tiny_thinker --force
 ```
 
-验证与算子检查（`--case` **必须传**，因为 `artifacts/` 下没有组件元数据）：
+验证与算子检查（`--case` 可省略，工具会读同目录 `export_metadata.json` 自动判断；下面显式写 `--case` 是为了顺带做一次交叉校验）：
 
 ```bash
 python validate_onnx.py --case rmsnorm      --model artifacts/rmsnorm/model.onnx
@@ -241,6 +241,8 @@ python inspect_onnx.py --model artifacts/tiny_thinker/model.onnx --fail-on-custo
 | `thinker_decode` | `input_ids [B,1]`、`attention_mask [B,past+1]`、`position_ids`、`cache_position`、`past_key/value_0..47` | `logits [B,1,V]` + `present_key/value_0..47` | **past-sequence 为动态轴**；自回归时把本步 96 个输出直接回灌为下步输入 |
 
 宿主程序负责：tokenizer 与媒体预处理、多模态占位与位置计算、自回归循环/采样/停止条件、prefill→decode 的 KV 交接。这些是 Python 控制流，不适合也不应该塞进单个 ONNX。
+
+**dtype 契约（已在导出时固定，宿主必须按此喂数据）**：`input_ids` / `attention_mask` / `cache_position` / `valid_indices` 为 `int64`，`cu_seqlens` 为 `int32`，`position_ids` 在 Prefill 与 Decode 两个图里**都是 `float32`**（来源为官方 `get_rope_index`），其余张量为 `float32`。
 
 ### 6.1 三部分权重、四张 ONNX 图
 
@@ -299,13 +301,13 @@ operators/summary.json          各组件节点数 + 全局唯一算子
 |---|---:|---:|
 | `rmsnorm` | 7 | 2.4e-7 |
 | `moe_block` | 33 | 1.5e-11 |
-| `tiny_thinker` | 142 | 3.0e-8 |
-| `vision_encoder` | 78 | 通过（含单图/多图/视频 grid 三种 profile） |
-| `audio_encoder` | 65 | 通过（多 chunk + 尾 chunk） |
+| `tiny_thinker` | 142 | 2.2e-8 |
+| `vision_encoder` | 78 | 5.6e-9（含单图/多图/视频 grid 三种 profile） |
+| `audio_encoder` | 65 | 1.2e-9（多 chunk + 尾 chunk） |
 | `thinker_prefill` | 160 | logits 4.5e-8 |
-| `thinker_decode`（动态 past 12/14） | 159 | logits 2.2e-8 |
+| `thinker_decode`（动态 past 12/14） | 158 | logits 2.2e-8 |
 
-四组件合计 **462 节点、41 种标准算子、0 个自定义 domain**（清单见产品包 `operators/all_operators.csv`）。
+四组件合计 **461 节点、41 种标准算子、0 个自定义 domain**（清单见产品包 `operators/all_operators.csv`）。
 
 关键算子（编译器/部署方最该关注的）：`MatMul(25) Mul(61) Transpose(44) Unsqueeze(40) Reshape(37) Add(39) Gather(14) Gemm(18) Softmax(6) LayerNormalization(7) Conv(4) Erf(8) TopK(2) GatherND(9) ScatterND(5) ScatterElements(4) NonZero(2) Where(3) Slice(19) Concat(13) ReduceMean(10) ReduceSum(6) Sin/Cos(2+2) Range(1) Shape(2) Expand(4)` 等。
 
@@ -355,25 +357,19 @@ print(onnx.printer.to_text(m.graph))   # 旧版用 onnx.helper.printable_graph(m
 "
 ```
 
-实测输出（RMSNorm 的真实计算图）：
+实测输出（RMSNorm 的真实计算图，onnx 1.22）：
 
 ```text
-graph main_graph (
-  %hidden_states[FLOAT, 1x4x8]
-) initializers (
-  %weight[FLOAT, 8]
-  %val_3[INT64, 1]
-  %val_0[FLOAT, scalar]
-  %val_4[FLOAT, scalar]
-) {
-  %pow_1      = Pow(%hidden_states, %val_0)
-  %mean       = ReduceMean[keepdims = 1](%pow_1, %val_3)
-  %add        = Add(%mean, %val_4)
-  %val_5      = Sqrt(%add)
-  %rsqrt      = Reciprocal(%val_5)
-  %mul        = Mul(%hidden_states, %rsqrt)
-  %normalized_hidden_states = Mul(%weight, %mul)
-  return %normalized_hidden_states
+main_graph (float[1,4,8] hidden_states) => (float[1,4,8] normalized_hidden_states)
+   <float[8] weight =  {1,1,1,1,1,1,1,1}, int64[1] val_3 =  {-1}, float val_0 =  {2}, float val_4 =  {1e-06}, ...>
+{
+   [node_pow_1] pow_1 = Pow (hidden_states, val_0)
+   [node_mean] mean = ReduceMean <noop_with_empty_axes: int = 0, keepdims: int = 1> (pow_1, val_3)
+   [node_add] add = Add (mean, val_4)
+   [node_Sqrt_5] val_5 = Sqrt (add)
+   [node_rsqrt] rsqrt = Reciprocal (val_5)
+   [node_mul] mul = Mul (hidden_states, rsqrt)
+   [node_mul_1] normalized_hidden_states = Mul (weight, mul)
 }
 ```
 
@@ -400,7 +396,7 @@ print('outputs:', [(v.name, [d.dim_value for d in v.type.tensor_type.shape.dim])
 4. **Attention 用 eager、MoE 用 `batched_mm`**：均为 Transformers v5.2.0 官方可切换实现，非自造算法；但与 FlashAttention/SDPA 存在浮点顺序差异，属正常数值误差。
 5. **媒体质量未评测**：端到端验证证明“张量接力正确”，不是语音/视觉感知质量基准。
 6. **官方权重本机不可导出**：59.08 GiB 权重 > 48 GiB 内存，已由 `--minimum-memory-gib` 门禁强制拦截，不会假成功。
-7. **Thinking 无语音输出**；需要语音请改用 Instruct checkpoint 并新增 Talker/CodePredictor/Code2Wav 三个组件（接口已调研，见 `docs` 两份说明文档）。
+7. **Thinking 无语音输出**；需要语音请改用 Instruct checkpoint 并新增 Talker/CodePredictor/Code2Wav 三个组件（接口调研结论见 `Qwen3-Omni_ONNX_任务交接说明.md` 第 12 节与本文件第 12 节）。
 
 ## 9. 后续步骤：在大内存 Linux 上导出官方权重
 
@@ -409,7 +405,8 @@ print('outputs:', [(v.name, [d.dim_value for d in v.type.tensor_type.shape.dim])
 ```text
 Linux x86_64，≥128 GiB RAM（导出四组件；端到端验证建议 ≥192 GiB）
 磁盘 ≥200 GiB（权重 59.08 GiB + ONNX external data + 中间产物）
-GPU 可选但推荐（real 默认 device=cuda，会按权重总量 1.2× 检查可用显存）
+GPU 可选但推荐（`--device` 默认是 `cpu`，用 GPU 必须显式传 `--device cuda`；此时脚本会按权重总量 1.2× 检查可用显存）
+`--minimum-memory-gib` 默认 128（real 模式物理内存保护线，低于该值直接拒绝执行）
 ```
 
 ### 9.2 步骤
@@ -433,9 +430,11 @@ python run_real_thinking_pipeline.py \
 
 # 内存充足时追加官方权重端到端验证（三步 Decode）
 python run_real_thinking_pipeline.py \
-    --model-path /data/Qwen3-Omni-30B-A3B-Thinking \
-    --run-end-to-end --minimum-memory-gib 128
+  --model-path /data/Qwen3-Omni-30B-A3B-Thinking \
+  --run-end-to-end --minimum-memory-gib 128
 ```
+
+⚠️ 上面第一条命令（默认不跑端到端）结束时 `build_thinking_package.py` 会以**非 0 退出**并打印 `status=unverified-real-artifacts`——这是预期行为，因为第 9.3 节的验收判据要求端到端通过。要拿到 `official-weight-components-validated`，必须显式加 `--run-end-to-end`。
 
 ### 9.3 交付验收判据
 

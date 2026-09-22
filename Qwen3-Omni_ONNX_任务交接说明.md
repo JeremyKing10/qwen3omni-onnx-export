@@ -107,7 +107,7 @@ source .venv/bin/activate
 ```text
 1. 检查 python3.11
 2. 若缺 transformers-v5.2.0 → 浅克隆 v5.2.0 并 checkout 固定 commit 7d9754a0…
-3. 克隆两个可选参考仓库（失败只告警，不影响导出）
+3. 克隆两个可选参考仓库（Qwen3-Omni → e4235853、TensorRT-Edge-LLM → e8b2952）并 checkout 各自固定 commit；失败只告警，不影响导出
 4. 创建 .venv → pip install -r requirements.txt → pip install -e ./transformers-v5.2.0
 5. 校验 transformers.__file__ 来自固定源码
 ```
@@ -1141,15 +1141,16 @@ inspect_onnx.py            # 输入输出、op_type、domain、节点数量、ex
 
 ```bash
 source /Users/bojunjin/Documents/LLM/qwen3-omni-onnx-work/.venv/bin/activate
-python export_onnx.py --case rmsnorm --output-dir artifacts/rmsnorm
+# 导出目录非空时必须带 --force，否则工具拒绝覆盖（防误删）
+python export_onnx.py --case rmsnorm --output-dir artifacts/rmsnorm --force
 python validate_onnx.py --case rmsnorm --model artifacts/rmsnorm/model.onnx
 python inspect_onnx.py --model artifacts/rmsnorm/model.onnx --output artifacts/rmsnorm/operators.json
 
-python export_onnx.py --case moe_block --output-dir artifacts/moe_block
+python export_onnx.py --case moe_block --output-dir artifacts/moe_block --force
 python validate_onnx.py --case moe_block --model artifacts/moe_block/model.onnx
 python inspect_onnx.py --model artifacts/moe_block/model.onnx --output artifacts/moe_block/operators.json
 
-python export_onnx.py --case tiny_thinker --output-dir artifacts/tiny_thinker
+python export_onnx.py --case tiny_thinker --output-dir artifacts/tiny_thinker --force
 python validate_onnx.py --case tiny_thinker --model artifacts/tiny_thinker/model.onnx
 python inspect_onnx.py --model artifacts/tiny_thinker/model.onnx --output artifacts/tiny_thinker/operators.json
 ```

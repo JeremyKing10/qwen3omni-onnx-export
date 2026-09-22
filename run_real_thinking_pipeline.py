@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -77,14 +78,27 @@ def main() -> None:
             str(max(args.minimum_memory_gib, 192.0)),
         )
     run("aggregate_operators.py", "--package-dir", str(package))
-    run(
+    # 打包可能因为未达验收判据而失败退出，这里显式检查退出码，避免 traceback 掩盖真实原因
+    command = [
+        sys.executable,
         "build_thinking_package.py",
         "--package-dir",
         str(package),
         "--source-dir",
         str(args.model_path.expanduser().resolve()),
         "--offline",
-    )
+    ]
+    print("\n$", " ".join(command), flush=True)
+    completed = subprocess.run(command, cwd=WORKSPACE, check=False)
+    if completed.returncode != 0:
+        raise SystemExit(completed.returncode)
+    status = json.loads((package / "manifest.json").read_text(encoding="utf-8")).get("status")
+    if status != "official-weight-components-validated":
+        print(
+            f"\n[FAIL] status={status}：未达到 README 第 9.3 节的官方权重验收判据",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     print(f"\n[OK] official-weight Thinking package completed: {package}")
 
 

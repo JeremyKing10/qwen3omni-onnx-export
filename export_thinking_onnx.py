@@ -44,12 +44,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=Path, help="real 模式下的官方 Thinking checkpoint 本地目录")
     parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--device", default="cpu", help="real 模式模型设备，例如 cpu 或 cuda")
-    parser.add_argument("--minimum-memory-gib", type=float, default=96.0, help="real 模式最低物理内存保护线")
+    parser.add_argument("--minimum-memory-gib", type=float, default=128.0, help="real 模式最低物理内存保护线")
     parser.add_argument("--package-dir", type=Path, default=DEFAULT_PACKAGE, help="产品根目录")
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--force", action="store_true", help="覆盖对应组件目录")
     return parser.parse_args()
+
+
+def estimate_weight_bytes(checkpoint_path: Path) -> int:
+    """估算官方 checkpoint 的权重总字节数；索引缺失字段时改用磁盘上的分片实际大小。"""
+    index_path = checkpoint_path / "model.safetensors.index.json"
+    if index_path.is_file():
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        declared = int(index.get("metadata", {}).get("total_size", 0))
+        if declared:
+            return declared
+        shard_names = sorted(set(index.get("weight_map", {}).values()))
+    else:
+        shard_names = ["model.safetensors"]
+    total = 0
+    for name in shard_names:
+        shard = checkpoint_path / name
+        if shard.is_file():
+            total += shard.stat().st_size
+    if not total:
+        raise RuntimeError(f"无法估算权重体积：{checkpoint_path}（既无 index 元数据也无可用权重分片）")
+    return total
+
+
+def invalidate_package_evidence(package_dir: Path) -> None:
+    """删除已经与当前 ONNX 不再对应的全局证据（manifest / 端到端 / 算子汇总）。"""
+    for stale in (
+        package_dir / "validation" / "end_to_end.json",
+        package_dir / "manifest.json",
+        package_dir / "operators" / "summary.json",
+        package_dir / "operators" / "all_operators.csv",
+    ):
+        if stale.is_file() and not stale.is_symlink():
+            stale.unlink()
 
 
 def safe_component_dir(package_dir: Path, component: str, force: bool) -> Path:
@@ -172,7 +205,6 @@ def main() -> None:
 
     full_model = None
     if args.mode == "real":
-        package_dir = args.package_dir.expanduser().resolve()
         if args.model_path is None:
             raise ValueError("real 模式必须提供 --model-path")
         memory = psutil.virtual_memory()
@@ -188,30 +220,28 @@ def main() -> None:
         if args.device.startswith("cuda"):
             if not torch.cuda.is_available():
                 raise RuntimeError("请求 CUDA 导出，但 torch.cuda 不可用")
-            index_path = checkpoint_path / "model.safetensors.index.json"
-            if not index_path.is_file():
-                raise FileNotFoundError(index_path)
-            index = json.loads(index_path.read_text(encoding="utf-8"))
-            weight_bytes = int(index.get("metadata", {}).get("total_size", 0))
-            free_vram, _ = torch.cuda.mem_get_info(torch.device(args.device))
+            device = torch.device(args.device)
+            if device.index is not None and device.index >= torch.cuda.device_count():
+                raise RuntimeError(
+                    f"请求的 CUDA 设备不存在：{args.device}（可用显卡数 {torch.cuda.device_count()}）"
+                )
+            weight_bytes = estimate_weight_bytes(checkpoint_path)
+            free_vram, _ = torch.cuda.mem_get_info(device)
             required_vram = int(weight_bytes * 1.2)
-            if weight_bytes and free_vram < required_vram:
+            if free_vram < required_vram:
                 raise RuntimeError(
                     f"CUDA 可用显存 {free_vram / 1024**3:.1f} GiB，小于估算需求 "
                     f"{required_vram / 1024**3:.1f} GiB"
                 )
         dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
         full_model = load_real_thinking_model(str(checkpoint_path), dtype=dtype, device=args.device)
-        if args.component == "all":
-            package_dir.mkdir(parents=True, exist_ok=True)
-            for stale in (
-                package_dir / "validation" / "end_to_end.json",
-                package_dir / "manifest.json",
-                package_dir / "operators" / "summary.json",
-                package_dir / "operators" / "all_operators.csv",
-            ):
-                if stale.is_file() and not stale.is_symlink():
-                    stale.unlink()
+
+    # 先确认目标目录可写（非空时必须 --force），再失效化全局证据：
+    # 顺序反过来会出现“证据已删、模型一个都没换”的损坏中间态。
+    package_dir = args.package_dir.expanduser().resolve()
+    for component in components:
+        safe_component_dir(package_dir, component, args.force)
+    invalidate_package_evidence(package_dir)
 
     for component in components:
         case = (
@@ -219,7 +249,7 @@ def main() -> None:
             if args.mode == "tiny"
             else build_real_thinking_component(full_model, component, args.seed)
         )
-        output_dir = safe_component_dir(args.package_dir, component, args.force)
+        output_dir = safe_component_dir(package_dir, component, args.force)
         export_component(case, output_dir, args.opset, args.seed, f"{args.mode}-fixed-shape")
 
 

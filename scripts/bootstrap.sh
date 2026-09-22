@@ -19,17 +19,29 @@ if [ ! -d transformers-v5.2.0 ]; then
 fi
 git -C transformers-v5.2.0 checkout --detach 7d9754a05193eb79b1d86aa744b622b8068008cd
 
-# 2. Qwen 官方示例仓库（可选，仅参考推理调用方式）
+# 2. Qwen 官方示例仓库（可选，仅参考推理调用方式；同样固定 commit 以保证可复现）
+QWEN_COMMIT=e4235853125589c789f06a2dd83e9f4126df5e9d
 if [ ! -d Qwen3-Omni ]; then
-    git clone --depth 1 https://github.com/QwenLM/Qwen3-Omni.git || \
+    git clone --no-checkout https://github.com/QwenLM/Qwen3-Omni.git Qwen3-Omni || \
         echo "[WARN] Qwen3-Omni 克隆失败，可稍后手动补拉（不影响导出工具）"
 fi
+if [ -d Qwen3-Omni/.git ]; then
+    git -C Qwen3-Omni fetch --depth 1 origin "$QWEN_COMMIT" || true
+    git -C Qwen3-Omni checkout --detach "$QWEN_COMMIT" || \
+        echo "[WARN] Qwen3-Omni 固定 commit 切换失败（仅参考仓库，不影响导出工具）"
+fi
 
-# 3. NVIDIA 参考导出器（可选，仅对照线需要）
+# 3. NVIDIA 参考导出器（可选，仅对照线需要；同样固定 commit）
+TRTLLM_COMMIT=e8b29522938901f6df19ebeedd4b69bc8edbcd97
 if [ ! -d TensorRT-Edge-LLM-v0.10.1 ]; then
-    git clone --depth 1 --branch v0.10.1 \
+    git clone --no-checkout \
         https://github.com/NVIDIA/TensorRT-Edge-LLM.git TensorRT-Edge-LLM-v0.10.1 || \
         echo "[WARN] TensorRT-Edge-LLM 克隆失败（仅参考线需要，可忽略）"
+fi
+if [ -d TensorRT-Edge-LLM-v0.10.1/.git ]; then
+    git -C TensorRT-Edge-LLM-v0.10.1 fetch --depth 1 origin "$TRTLLM_COMMIT" || true
+    git -C TensorRT-Edge-LLM-v0.10.1 checkout --detach "$TRTLLM_COMMIT" || \
+        echo "[WARN] TensorRT-Edge-LLM 固定 commit 切换失败（仅参考线需要，可忽略）"
 fi
 
 # 4. 虚拟环境与依赖

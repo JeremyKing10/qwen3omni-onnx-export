@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -312,6 +313,13 @@ def main() -> None:
     }
     write_json(package_dir / "manifest.json", manifest)
     print(f"[OK] package={package_dir}")
+    if real_weights and status != "official-weight-components-validated":
+        # 官方权重产品没通过验收判据时必须失败退出，否则上游一条龙脚本会误报成功
+        print(
+            f"[FAIL] status={status}：官方权重产品未通过验收判据，详见 manifest.json",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     print(f"[OK] status={manifest['status']}")
 
 

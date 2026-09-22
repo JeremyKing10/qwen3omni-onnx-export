@@ -415,7 +415,10 @@ def prepare_audio_inputs(
         boundaries.extend([window_after_cnn] * full_windows)
         if remainder:
             boundaries.append(remainder)
-    cu_seqlens = torch.tensor(boundaries, dtype=torch.int32, device=feature_lens.device).cumsum(0)
+    # dtype 必须显式传给 cumsum，否则 PyTorch 会把 int32 提升成 int64（与 HF 参考实现的 int32 契约不符）
+    cu_seqlens = torch.tensor(boundaries, dtype=torch.int32, device=feature_lens.device).cumsum(
+        0, dtype=torch.int32
+    )
     return padded, valid_indices, cu_seqlens
 
 
@@ -671,7 +674,11 @@ def build_tiny_thinking_component(component: str, seed: int = DEFAULT_SEED) -> T
             output_names=("audio_embeddings",),
             description="Thinking Audio Encoder；变长分块与 mask 构造由宿主预处理",
             config=config.to_dict(),
-            interface={"feature_length_profile": 20, "host_preprocessing": True, "chunk_count": 2},
+            interface={
+                "feature_length_profile": 20,
+                "host_preprocessing": True,
+                "chunk_count": int(vectors[0][0].shape[0]),
+            },
             source_equivalence={"checked": True, "max_abs_error": error},
         )
 
@@ -770,7 +777,8 @@ def build_tiny_thinking_component(component: str, seed: int = DEFAULT_SEED) -> T
         past_length = prefill_input[0].shape[1]
         decode_mask = torch.ones(1, past_length + 1, dtype=torch.int64)
         decode_position_value = past_length + int(rope_delta.item())
-        decode_position = torch.full((3, 1, 1), decode_position_value, dtype=torch.int64)
+        # 与 Prefill 保持一致：Prefill 的 position_ids 来自官方 get_rope_index，是 float32
+        decode_position = torch.full((3, 1, 1), decode_position_value, dtype=torch.float32)
         decode_cache_position = torch.tensor([past_length], dtype=torch.int64)
         decode_vectors.append(
             (next_token, decode_mask, decode_position, decode_cache_position, *prefill_output[1:])
@@ -877,6 +885,7 @@ def build_real_thinking_component(
     """Build an official-weight component case. Intended for the large-memory Linux stage."""
     if component not in THINKING_COMPONENTS:
         raise ValueError(f"未知 Thinking 组件 {component!r}")
+    assert_transformers_provenance()
     torch.manual_seed(seed)
     np.random.seed(seed)
     thinker = full_model.thinker
@@ -956,7 +965,11 @@ def build_real_thinking_component(
             output_names=("audio_embeddings",),
             description="官方权重 Thinking Audio Encoder",
             config=audio.config.to_dict(),
-            interface={"feature_length_profile": feature_length, "host_preprocessing": True, "chunk_count": 2},
+            interface={
+                "feature_length_profile": feature_length,
+                "host_preprocessing": True,
+                "chunk_count": int(vectors[0][0].shape[0]),
+            },
             source_equivalence={"checked": True, "max_abs_error": max(equivalence_errors)},
             checkpoint_fingerprint=getattr(full_model, "_onnx_checkpoint_provenance", None),
         )
@@ -971,16 +984,21 @@ def build_real_thinking_component(
         * vision_grid[2]
         // (thinker.visual.spatial_merge_size**2)
     )
+    # 守卫必须用与实际建 prompt 完全相同的 audio_feature_length，否则会放行随后必然失败的序列长度
+    audio_feature_length = thinker.audio_tower.n_window * 2 + 1
     audio_tokens = int(
         _get_feat_extract_output_lengths(
-            torch.tensor([thinker.audio_tower.n_window * 2], dtype=torch.int64)
+            torch.tensor([audio_feature_length], dtype=torch.int64)
         )[0]
     )
-    if text_sequence_length < vision_tokens + audio_tokens + 2:
+    # build_multimodal_prompt 实际需要：prefix(1) + vision_start(1) + V + vision_end(1)
+    #                                + audio_start(1) + A + audio_end(1) = V + A + 5
+    minimum_length = vision_tokens + audio_tokens + 5
+    if text_sequence_length < minimum_length:
         raise ValueError(
-            f"text_sequence_length={text_sequence_length} 无法容纳 {vision_tokens} 个视觉和 {audio_tokens} 个音频 token"
+            f"text_sequence_length={text_sequence_length} 无法容纳 {vision_tokens} 个视觉和 "
+            f"{audio_tokens} 个音频 token（至少需要 {minimum_length}）"
         )
-    audio_feature_length = thinker.audio_tower.n_window * 2 + 1
     first_prompt = build_multimodal_prompt(
         thinker,
         text_sequence_length,

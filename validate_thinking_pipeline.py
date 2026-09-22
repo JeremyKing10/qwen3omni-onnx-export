@@ -5,12 +5,20 @@ import json
 from pathlib import Path
 from typing import Any
 
+import ml_dtypes
 import numpy as np
 import onnxruntime as ort
 import psutil
 import torch
 
-from qwen3_omni_onnx_cases import DEFAULT_SEED, file_sha256, normalize_outputs, tensor_to_numpy, write_json
+from qwen3_omni_onnx_cases import (
+    DEFAULT_SEED,
+    WORKSPACE,
+    file_sha256,
+    normalize_outputs,
+    tensor_to_numpy,
+    write_json,
+)
 from qwen3_omni_thinking_components import (
     build_real_thinking_component,
     build_tiny_thinking_component,
@@ -24,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=Path, help="real 模式官方 checkpoint 目录")
     parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--minimum-memory-gib", type=float, default=96.0)
+    parser.add_argument("--minimum-memory-gib", type=float, default=128.0)
     parser.add_argument("--provider", default="CPUExecutionProvider")
     parser.add_argument(
         "--package-dir",
@@ -46,7 +54,8 @@ ORT_DTYPE_MAP = {
     "tensor(float)": np.float32,
     "tensor(float16)": np.float16,
     "tensor(double)": np.float64,
-    "tensor(bfloat16)": np.float32,
+    # bf16 图的输入必须喂 bf16；喂 float32 会被 ORT 直接拒绝（real 模式 --dtype bfloat16 会走这里）
+    "tensor(bfloat16)": ml_dtypes.bfloat16,
     "tensor(int64)": np.int64,
     "tensor(int32)": np.int32,
     "tensor(bool)": np.bool_,
@@ -106,6 +115,15 @@ def compare_outputs(
 def main() -> None:
     args = parse_args()
     package_dir = args.package_dir.expanduser().resolve()
+    workspace = WORKSPACE.resolve()
+    try:
+        package_dir.relative_to(workspace)
+    except ValueError as error:
+        raise ValueError(f"产品目录必须位于工作区 {workspace} 内：{package_dir}") from error
+    if package_dir == workspace:
+        raise ValueError("产品目录不能是工作区根目录")
+    if package_dir.exists() and package_dir.is_symlink():
+        raise ValueError(f"拒绝符号链接路径：{package_dir}")
     if args.provider not in ort.get_available_providers():
         raise RuntimeError(
             f"ORT provider {args.provider} 不可用；当前可用：{ort.get_available_providers()}"
@@ -114,6 +132,7 @@ def main() -> None:
     if args.mode == "real":
         if args.model_path is None:
             raise ValueError("real 模式必须提供 --model-path")
+        checkpoint_path = args.model_path.expanduser().resolve()
         memory = psutil.virtual_memory()
         total_memory_gib = memory.total / 1024**3
         available_memory_gib = memory.available / 1024**3
@@ -123,8 +142,10 @@ def main() -> None:
                 f"{args.minimum_memory_gib * 0.75:.0f} GiB 可用；当前总计 {total_memory_gib:.1f} GiB、"
                 f"可用 {available_memory_gib:.1f} GiB"
             )
+        if args.device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("请求 CUDA 端到端验证，但 torch.cuda 不可用")
         dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
-        full_model = load_real_thinking_model(str(args.model_path.resolve()), dtype=dtype, device=args.device)
+        full_model = load_real_thinking_model(str(checkpoint_path), dtype=dtype, device=args.device)
     cases = {
         name: (
             build_tiny_thinking_component(name, args.seed)

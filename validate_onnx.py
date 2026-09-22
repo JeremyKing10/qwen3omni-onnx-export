@@ -153,6 +153,18 @@ def validate_vector(
     }
 
 
+def write_failure(report_path: Path, model_path: Path, error: BaseException, started: float) -> None:
+    write_json(
+        report_path,
+        {
+            "passed": False,
+            "model": str(model_path),
+            "error": f"{type(error).__name__}: {error}",
+            "elapsed_seconds": time.perf_counter() - started,
+        },
+    )
+
+
 def main() -> None:
     args = parse_args()
     validate_tolerance("rtol", args.rtol)
@@ -161,19 +173,25 @@ def main() -> None:
     model_path = args.model.expanduser().resolve()
     model_dir = model_path.parent
     report_path = model_dir / "validation.json"
-    report_path.unlink(missing_ok=True)
     started = time.perf_counter()
 
-    try:
-        if not model_path.is_file():
-            raise FileNotFoundError(model_path)
-        metadata = load_metadata(model_dir)
-        if args.case and metadata["case"] != args.case:
-            raise ValueError(f"case 不一致：参数={args.case} 元数据={metadata['case']}")
-        model_hash = file_sha256(model_path)
-        if model_hash != metadata["model_sha256"]:
-            raise RuntimeError("ONNX 文件哈希与导出元数据不一致")
+    # 身份校验（case / 模型哈希）必须在动任何报告之前完成。
+    # --case 传错属于调用方式错误，不能因此覆盖掉该模型原有的有效验证报告。
+    if not model_path.is_file():
+        raise FileNotFoundError(model_path)
+    metadata = load_metadata(model_dir)
+    if args.case and metadata["case"] != args.case:
+        raise ValueError(f"case 不一致：参数={args.case} 元数据={metadata['case']}")
+    model_hash = file_sha256(model_path)
+    if model_hash != metadata["model_sha256"]:
+        # 文件已被替换/篡改，旧报告对新文件不再成立，必须失效化再写失败报告。
+        error = RuntimeError("ONNX 文件哈希与导出元数据不一致")
+        report_path.unlink(missing_ok=True)
+        write_failure(report_path, model_path, error, started)
+        raise error
 
+    report_path.unlink(missing_ok=True)
+    try:
         onnx.checker.check_model(str(model_path), full_check=True)
         shape_inference: dict[str, Any] = {
             "attempted": not args.skip_shape_inference,
@@ -272,15 +290,7 @@ def main() -> None:
         }
         write_json(report_path, report)
     except Exception as error:
-        write_json(
-            report_path,
-            {
-                "passed": False,
-                "model": str(model_path),
-                "error": f"{type(error).__name__}: {error}",
-                "elapsed_seconds": time.perf_counter() - started,
-            },
-        )
+        write_failure(report_path, model_path, error, started)
         raise
 
     for vector in report["test_vectors"]:

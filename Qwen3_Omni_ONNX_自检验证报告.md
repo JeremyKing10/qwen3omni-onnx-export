@@ -79,10 +79,10 @@ python run_local_thinking_pipeline.py
 [OK] vector=0 logits: max_abs=2.23517e-08, max_rel=1.65148e-06
 [OK] vector=1 logits: max_abs=1.49012e-08, max_rel=1.57795e-05
 [OK] distinct_routing_patterns=2
-[OK] nodes=159
+[OK] nodes=158
 [OK] custom_domains=none
 [OK] end_to_end=.../validation/end_to_end.json
-[OK] total_nodes=462
+[OK] total_nodes=461
 [OK] unique_operators=41
 [OK] status=tiny-interface-validation-only
 [OK] local Thinking pipeline completed
@@ -159,9 +159,9 @@ routing_coverage: distinct_patterns=2, passed=True
 
 ```text
 vision_encoder   107ab651abe0706d…
-audio_encoder    26a8e244d3abee3e…
+audio_encoder    3662251850bf07be…
 thinker_prefill  e9bce1965cfb7eb2…
-thinker_decode   1575e274c7c7acd9…
+thinker_decode   846aacca245bf8a3…
 ```
 
 算子分布（`operators/summary.json`）：
@@ -170,8 +170,8 @@ thinker_decode   1575e274c7c7acd9…
 vision_encoder   78 节点
 audio_encoder    65 节点
 thinker_prefill 160 节点
-thinker_decode 159 节点
-合计 462 节点，41 种算子，0 个自定义 domain
+thinker_decode 158 节点
+合计 461 节点，41 种算子，0 个自定义 domain
 Top10: Mul(61), Transpose(44), Unsqueeze(40), Add(39), Reshape(37),
        MatMul(25), Slice(19), Gemm(18), Gather(14), Concat(13)
 ```
@@ -211,6 +211,8 @@ ValueError: case 不一致：参数=rmsnorm 元数据=thinker_prefill
 ```
 
 > ⚠️ **重要提醒**：不要用 `python xxx | tail -1; echo $?` 来判断退出码——`$?` 取到的是 `tail` 的退出码（永远是 0），必须用 `python xxx >/dev/null 2>&1; echo $?` 才能得到 Python 的真实退出码。
+
+> 安全性说明：`validate_onnx.py` 只在**模型身份校验（case + ONNX 哈希）通过**之后才允许写/覆盖 `validation.json`。因此测试 4（`--case` 传错，属于调用方式错误）**不会**碰掉该模型原本有效的验证报告；只有测试 1（文件被篡改，哈希不一致）才会失效化旧报告——因为旧报告对新文件已不成立。
 
 ---
 

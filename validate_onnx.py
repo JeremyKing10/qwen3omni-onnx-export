@@ -14,12 +14,19 @@ import onnx
 import onnxruntime as ort
 
 from qwen3_omni_onnx_cases import SUPPORTED_CASES, file_sha256, write_json
+from qwen3_omni_thinking_components import THINKING_COMPONENTS
+
+KNOWN_CASES = tuple(SUPPORTED_CASES) + tuple(THINKING_COMPONENTS)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="校验 Qwen3-Omni ONNX 的结构、Shape 和多组输入数值")
     parser.add_argument("--model", type=Path, required=True, help="ONNX 模型路径")
-    parser.add_argument("--case", choices=SUPPORTED_CASES, help="可选；必须与导出元数据一致")
+    parser.add_argument(
+        "--case",
+        choices=KNOWN_CASES,
+        help="可选；必须与导出元数据一致。早期三级回归用 rmsnorm/moe_block/tiny_thinker，四组件用 vision_encoder/audio_encoder/thinker_prefill/thinker_decode",
+    )
     parser.add_argument("--rtol", type=float, default=1e-4, help="相对误差阈值")
     parser.add_argument("--atol", type=float, default=1e-5, help="绝对误差阈值")
     parser.add_argument("--skip-shape-inference", action="store_true", help="跳过 Shape Inference")

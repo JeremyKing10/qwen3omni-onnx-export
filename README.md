@@ -148,6 +148,22 @@ python validate_onnx.py \
     --model Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/thinker_prefill/model.onnx
 ```
 
+说明：
+
+- `--case` **可省略**——不传时工具直接读取同目录 `export_metadata.json` 来判断这是哪个模型。
+- 传了 `--case` 会做一次**交叉校验**：参数值必须与该 ONNX 的导出元数据一致，不一致直接报错（防止拿错文件还以为验证通过了）。
+- 合法取值共 7 个：
+  - 早期三级回归：`rmsnorm` / `moe_block` / `tiny_thinker`
+  - 四组件：`vision_encoder` / `audio_encoder` / `thinker_prefill` / `thinker_decode`
+
+```bash
+# 不传 --case（推荐，最不容易出错）
+python validate_onnx.py --model Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/thinker_decode/model.onnx
+
+# 早期回归必须传 --case（因为 artifacts 下的模型没有组件元数据）
+python validate_onnx.py --case moe_block --model artifacts/moe_block/model.onnx
+```
+
 ### 5.3 算子 / 结构检查
 
 ```bash

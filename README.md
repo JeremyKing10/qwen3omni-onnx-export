@@ -123,6 +123,21 @@ Qwen3-Omni-30B-A3B-Thinking-ONNX/
 
 ## 5. 命令参考
 
+**哪个 ONNX 由哪条命令产出**（全仓库一共 7 个 `model.onnx`）：
+
+| 产物路径 | 导出命令 |
+|---|---|
+| `artifacts/rmsnorm/model.onnx` | `python export_onnx.py --case rmsnorm --output-dir artifacts/rmsnorm --force` |
+| `artifacts/moe_block/model.onnx` | `python export_onnx.py --case moe_block --output-dir artifacts/moe_block --force` |
+| `artifacts/tiny_thinker/model.onnx` | `python export_onnx.py --case tiny_thinker --output-dir artifacts/tiny_thinker --force` |
+| `Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/vision_encoder/model.onnx` | `python export_thinking_onnx.py --mode tiny --component vision_encoder --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX --force` |
+| `.../onnx/audio_encoder/model.onnx` | 同上，`--component audio_encoder` |
+| `.../onnx/thinker_prefill/model.onnx` | 同上，`--component thinker_prefill` |
+| `.../onnx/thinker_decode/model.onnx` | 同上，`--component thinker_decode` |
+
+> 四个组件实际上一条命令就能全出：`--component all`（见 5.1）。
+> 想一步到位连导出+验证+端到端+算子汇总+打包全跑完，用 `python run_local_thinking_pipeline.py`（第 4 节）。
+
 ### 5.1 四组件导出
 
 ```bash
@@ -190,12 +205,27 @@ python build_thinking_package.py --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX 
 
 ### 5.6 早期三级 tiny 回归（RMSNorm / MoE Block / Tiny Thinker）
 
+`artifacts/` 下的三个 ONNX 都由 `export_onnx.py` 产出，一条命令一个（**必须带 `--force`**，否则目录非空会拒绝覆盖）：
+
 ```bash
-python export_onnx.py   --case moe_block    --output-dir artifacts/moe_block --force
-python validate_onnx.py --case moe_block    --model artifacts/moe_block/model.onnx
-python inspect_onnx.py  --model artifacts/moe_block/model.onnx --fail-on-custom-domain
-# --case 另有 rmsnorm / tiny_thinker
+python export_onnx.py --case rmsnorm      --output-dir artifacts/rmsnorm      --force
+python export_onnx.py --case moe_block    --output-dir artifacts/moe_block    --force
+python export_onnx.py --case tiny_thinker --output-dir artifacts/tiny_thinker --force
 ```
+
+验证与算子检查（`--case` **必须传**，因为 `artifacts/` 下没有组件元数据）：
+
+```bash
+python validate_onnx.py --case rmsnorm      --model artifacts/rmsnorm/model.onnx
+python validate_onnx.py --case moe_block    --model artifacts/moe_block/model.onnx
+python validate_onnx.py --case tiny_thinker --model artifacts/tiny_thinker/model.onnx
+
+python inspect_onnx.py --model artifacts/rmsnorm/model.onnx      --fail-on-custom-domain
+python inspect_onnx.py --model artifacts/moe_block/model.onnx    --fail-on-custom-domain
+python inspect_onnx.py --model artifacts/tiny_thinker/model.onnx --fail-on-custom-domain
+```
+
+> 输出目录被限制为 `artifacts/` 的直接子目录（`export_onnx.py` 强制校验），所以 `--output-dir` 不能写到别处。
 
 ## 6. 四组件 ONNX 接口
 
@@ -274,6 +304,89 @@ operators/summary.json          各组件节点数 + 全局唯一算子
 四组件合计 **462 节点、41 种标准算子、0 个自定义 domain**（清单见产品包 `operators/all_operators.csv`）。
 
 关键算子（编译器/部署方最该关注的）：`MatMul(25) Mul(61) Transpose(44) Unsqueeze(40) Reshape(37) Add(39) Gather(14) Gemm(18) Softmax(6) LayerNormalization(7) Conv(4) Erf(8) TopK(2) GatherND(9) ScatterND(5) ScatterElements(4) NonZero(2) Where(3) Slice(19) Concat(13) ReduceMean(10) ReduceSum(6) Sin/Cos(2+2) Range(1) Shape(2) Expand(4)` 等。
+
+### 7.1 怎么查看导出的 ONNX
+
+#### `.onnx` 和 `.onnx.data` 分别是什么
+
+| 文件 | 内容 | 说明 |
+|---|---|---|
+| `model.onnx` | **计算图**：节点、连接关系、输入输出 Shape/dtype、算子属性 | protobuf 二进制，用文本编辑器打开必然是乱码，**不要编辑** |
+| `model.onnx.data` | **权重**（initializer） | ONNX 单文件 protobuf 上限 2 GB，大模型权重必须外置；`model.onnx` 里记录每个张量在 data 文件中的 offset/length |
+
+**铁律**：两个文件必须**同目录、成对**存放/拷贝/传输，缺一个或改名就打不开。
+
+#### 方式一：Netron 可视化（最直观，推荐）
+
+网页版，无需安装：
+
+1. 打开 <https://netron.app>
+2. 把 `model.onnx` **拖进页面**
+3. 即可看到：整图拓扑、每个节点的算子与属性、输入输出 Shape/dtype、点击节点看权重信息
+
+> 想让 Netron 显示权重数值，把同目录的 `model.onnx.data` 也放在本地即可（网页版读取的是你本地文件，不会上传模型）。
+
+本地安装（可选）：
+
+```bash
+pip install netron && netron artifacts/rmsnorm/model.onnx   # 浏览器打开
+brew install --cask netron                                  # macOS App
+```
+
+#### 方式二：本仓库自带的 `inspect_onnx.py`（出 JSON 报告）
+
+```bash
+python inspect_onnx.py --model artifacts/rmsnorm/model.onnx
+```
+
+输出 ir_version、opset、输入输出名/Shape/dtype、节点数、每种 `domain::OpType` 计数、自定义 domain、external data 校验，并写入 `operators.json`。
+
+#### 方式三：ONNX 官方 API 打印可读计算图
+
+```bash
+python -c "
+import onnx
+m = onnx.load('artifacts/rmsnorm/model.onnx')
+print(onnx.printer.to_text(m.graph))   # 旧版用 onnx.helper.printable_graph(m.graph)
+"
+```
+
+实测输出（RMSNorm 的真实计算图）：
+
+```text
+graph main_graph (
+  %hidden_states[FLOAT, 1x4x8]
+) initializers (
+  %weight[FLOAT, 8]
+  %val_3[INT64, 1]
+  %val_0[FLOAT, scalar]
+  %val_4[FLOAT, scalar]
+) {
+  %pow_1      = Pow(%hidden_states, %val_0)
+  %mean       = ReduceMean[keepdims = 1](%pow_1, %val_3)
+  %add        = Add(%mean, %val_4)
+  %val_5      = Sqrt(%add)
+  %rsqrt      = Reciprocal(%val_5)
+  %mul        = Mul(%hidden_states, %rsqrt)
+  %normalized_hidden_states = Mul(%weight, %mul)
+  return %normalized_hidden_states
+}
+```
+
+看单个节点：
+
+```bash
+python -c "
+import onnx
+m = onnx.load('artifacts/rmsnorm/model.onnx', load_external_data=False)
+for i, n in enumerate(m.graph.node[:5]):
+    print(f'{i}: {n.op_type:12s} inputs={list(n.input)} outputs={list(n.output)}')
+print('inputs :', [(v.name, [d.dim_value for d in v.type.tensor_type.shape.dim]) for v in m.graph.input])
+print('outputs:', [(v.name, [d.dim_value for d in v.type.tensor_type.shape.dim]) for v in m.graph.output])
+"
+```
+
+> `load_external_data=False` 表示**只读图结构、不读权重**，所以几十 GB 的真实模型也能秒开查看（`inspect_onnx.py` 内部就是这么做的）。
 
 ## 8. 局限性（务必阅读）
 

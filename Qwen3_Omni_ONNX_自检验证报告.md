@@ -275,7 +275,20 @@ rm -rf artifacts/_tamper
 
 ---
 
-## 5. 相关文件
+## 5. 附：怎么查看导出的 ONNX
+
+- `.onnx` = 计算图（protobuf 二进制，文本编辑器打开是乱码，不要编辑）
+- `.onnx.data` = 权重（protobuf 单文件 2 GB 上限，故外置）；两者必须同目录成对存放
+
+三种查看方式：
+
+1. **Netron 网页版（最直观）**：打开 <https://netron.app>，把 `model.onnx` 拖进去即可看到拓扑、算子属性、Shape/dtype。
+2. **本仓库工具**：`python inspect_onnx.py --model <path>` 输出 JSON 报告。
+3. **官方 API 打印可读图**：`python -c "import onnx; print(onnx.printer.to_text(onnx.load('<path>').graph))"`
+
+详见 `README.md` 第 7.1 节。
+
+## 6. 相关文件
 
 | 文件 | 作用 |
 |---|---|

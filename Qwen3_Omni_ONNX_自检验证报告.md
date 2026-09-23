@@ -1,35 +1,50 @@
 # Qwen3-Omni ONNX 导出工具：自检验证报告
 
-> 本文回答一个问题：**凭什么说这套 ONNX 导出工具是真实有效的？**
-> 文中所有输出均为本机（macOS arm64，48 GiB 内存）**实际执行结果**，可原样复现。
-> 执行日期：2026-09-22
->
-> 时效性说明：报告里的**数值**（节点数、模型哈希、误差）由 2026-09-22 全量重跑产生。若之后改动导出代码导致图结构变化（例如 dtype 调整会让节点数与哈希改变），请以重跑后的实际输出为准；第 2 节列出的四个模型哈希就是判断"当前产物是否与本报告同一批"的依据。
+> 本文区分**历史实验记录**与**本轮验收**，不将未执行的命令写成实测通过。
+> 第 1～2 节保存 2026-09-22 的 macOS arm64、48 GiB 历史环境与输出摘录；461 节点 / 41 种算子、旧哈希和旧 e2e 结论只属于该批旧产物，不是本轮结果。
+> 2026-09-23 修订：旧记录没有完整证明官方顶层语义，且本轮代码和证据格式已变化。不能只改数字、哈希或 JSON 将它们升级为 schema v2；必须重新导出、验证和打包。
+> 当前脚本的推荐验收命令在第 4 节；本轮实测状态在第 0.1 节。本文保留的历史命令不是“所有命令均已实跑”的声明。
 
 ---
 
 ## 0. 结论先说清楚
 
-### ✅ 已被证明的部分
+### 已有证据的适用范围
 
-这套工具能把 **Qwen3-Omni 在 Transformers v5.2.0 官方类上的 `forward`**，通过 `torch.onnx.export(dynamo=True)` 转成 **只含标准 ONNX 算子**的图，并且：
+历史日志记录了 tiny 随机权重四组件在指定样例下的导出、标准算子检查、Wrapper 与 ORT 数值对比及三步 Cache 回灌。tiny 文本只有 **1 层、2 个 KV 张量**，不是官方 48 层的 96 个；tiny vision/audio 均 1 层，audio 为 16 mel bins、20 帧。real 默认 audio profile 为 101 帧。
 
-1. MoE 动态路由正确（TopK → Gather → BatchedMatMul → ReduceSum），**不是**把第一次导出的专家固化；
-2. KV Cache 展平 + 自回归续接正确（Prefill 输出 96 个 K/V，Decode 三步回灌都对）；
-3. PyTorch 与 ONNX Runtime 输出**数值等价**；
-4. 产物无自定义 domain；
-5. 所有验证机制（哈希链、容差校验、路径防护、case 交叉校验）实测能拦截问题。
+有限样例一致只支持相应环境、Shape、dtype、输入和容差内的结论，既不是数学等价证明，也不能排除 Wrapper 和验证器共同使用错误位置的情况。本轮要求将**官方顶层语义 → Wrapper**与**Wrapper → ORT**分成独立参考链。
 
-### ❌ 未被证明的部分
+### 尚未验收的部分
 
-| 未证明 | 原因 |
+| 未验收项 | 边界 |
 |---|---|
-| 官方 30B 权重能导出 | 本机 48 GiB < 权重 59.08 GiB，**从未真正加载过官方权重** |
-| 官方模型的算子**数量** | tiny 为 1 层 / 4 专家；真实 48 层 / 128 专家会让数量成倍变化 |
-| 导出模型的语义正确性 | tiny 权重是随机的，不含知识 |
-| 真实媒体上的效果 | 只做了合成张量的张量接力验证 |
+| 官方 30B 四组件及 real 端到端 | 本机 48 GiB 未安全加载约 59.08 GiB 权重；目标机仍需实测 |
+| 官方规模算子、峰值内存与内核支持 | 不能由 tiny 计数或内存门槛推断；128/192 GiB 不是成功保证 |
+| 全部动态长度 / 专家组合 | 64 是 Decode 导出约束上界，有限 profile 测试不覆盖全范围 |
+| 真实媒体与生成质量 | 合成张量测试不是质量基准 |
+| 完整 Qwen BF16 的 CPU/CUDA 执行 | 数据交换支持不等于所有算子内核支持，换 CUDA 不保证成功 |
 
-一句话：**工具是真的、链路是通的、验证是硬的；唯一没做的是把 59 GiB 真权重灌进去——那只需要一台内存够的机器，不需要改代码。**
+### 0.1 本轮验收（2026-09-23）
+
+- 持久回归入口：`python -B -m unittest discover -s tests -v`，测试位于 `tests/test_*.py`，公共产物逻辑在 `onnx_artifact_utils.py`。
+- 已有局部测试事实：内存内 CPU IOBinding Cast/Identity 小图与 BF16 NPZ bit-preserving 往返成功；此结论仅覆盖 BF16 数据交换，不代表完整 Qwen BF16 内核可用。
+### 本轮实测（2026-09-23，macOS arm64、48 GiB，仅 tiny）
+
+```bash
+.venv/bin/python -B -m unittest discover -s tests -v
+.venv/bin/python -B run_local_thinking_pipeline.py --offline
+```
+
+- 持久 unittest：**59 项全部通过**（公共证据 24、语义 12、端到端证据 7、打包证据 16 分布在三个文件中）。
+- 一键 tiny 全流程：退出码 **0**，并生成 `status=tiny-interface-validation-only`、`passed=true` 的 manifest。
+- 产物统计（schema v2）：`vision_encoder 84`、`audio_encoder 65`、`thinker_prefill 160`、`thinker_decode 158`，合计 **467 节点、41 种标准算子、0 个自定义 domain**。
+- 模型哈希前缀：`vision 97198aa0e3644a7b`、`audio 3678ad997d691a9d`、`prefill 8824b3c12dd642de`、`decode 5d3fd0358285e4fe`。
+- 端到端 3 步 Decode，参考范围 `official_top_level_with_raw_synthetic_features`、`reference_positions=official_forward_independent_mrope_and_cache`；各阶段最大绝对误差：vision `5.59e-09`、audio `1.16e-09`、prefill `8.34e-07`、decode 三步均 `8.34e-07`。
+- 三组早期回归（rmsnorm / moe_block / tiny_thinker）重新导出并严格验证通过。
+
+**未覆盖**：官方 30B 权重、CUDA/其它 provider、完整 Qwen 的 FP16/BF16 图内核兼容性、真实磁盘峰值。下方历史数字与哈希属于旧产物。
+- 旧产物必须重新导出验收；不允许仅编辑 metadata、JSON 报告或本报告数字来制造通过。
 
 ---
 
@@ -47,7 +62,7 @@ Transformers  v5.2.0（固定源码，commit 7d9754a05193eb79b1d86aa744b622b8068
 
 ---
 
-## 2. 核实方案与原始输出
+## 2. 历史核实方案与输出摘录（2026-09-22，非本轮验收）
 
 ### 步骤 1：语法与源码来源
 
@@ -218,64 +233,51 @@ ValueError: case 不一致：参数=rmsnorm 元数据=thinker_prefill
 
 ---
 
-## 3. 证据链全景图
+## 3. 本轮证据链要求（不等同于实测结果）
 
 ```text
-① 固定源码来源（commit 校验）
+固定 Transformers 来源、checkpoint 身份与导出时 source_snapshot 真实 bytes
         ↓
-② ONNX Checker（full_check=True）
+官方顶层语义 → Wrapper（独立位置/Cache 参考）
         ↓
-③ 严格 Shape Inference（未知维度 = 0）
+导出 ONNX + external data + metadata + 输入/参考向量
         ↓
-④ ONNX Runtime 标准后端执行（CPUExecutionProvider）
+Checker + strict shape inference + 实际图域/算子清单
         ↓
-⑤ PyTorch vs ONNX 数值对比（rtol=1e-4, atol=1e-5，实测 1e-7 量级）
+Wrapper → ORT（记录 provider、逐张量 shape/dtype、有限容差、NaN/Inf）
         ↓
-⑥ MoE 双路由覆盖（两种 Top-K 结果都一致）
+多组 MoE 路由 + 三步 Decode（tiny 2 KV；官方 96 KV 待 real 实测）
         ↓
-⑦ 三步 Decode KV 回灌一致性
+schema v2 报告绑定当前 ONNX、external data、metadata 与向量
         ↓
-⑧ 结构纯净（0 自定义 domain + external data 完整）
-        ↓
-⑨ 哈希链交叉绑定（模型/输入/参考输出/external data，换文件即报错）
-        ↓
-   manifest.json 状态判定（tiny-interface-validation-only）
+算子汇总 / 打包重新核验 → manifest 状态
 ```
+
+上图为验收要求：导出时真实源码 bytes 归档仍待实现与验收，不能把当前源码 hash/environment/git 声称为可恢复的 `source_snapshot/` 归档。`tools/` 是打包时快照，也不能代替导出源码。即使后续补齐源码归档，仍须恢复 bootstrap、固定 Transformers 与平台依赖；lock 当前 torch 项为 `torch==2.8.0`，不是 macOS wheel URL。
+
+哈希用于发现意外混用或文件改变，不是签名、可信时间戳或真实性自证。若能同时改写产物与全部证据，哈希本身不能证明原始身份；正式可信分发需额外可信渠道。
 
 ---
 
-## 4. 一键复现脚本
+## 4. 当前推荐验收命令（不是执行记录）
 
-把下面整段粘进终端即可完整复核（约 1 分钟）：
+先恢复固定源码与依赖，再在工作区执行。以下不抑制 stderr，也不经 `grep/tail` 隐藏失败；执行结果需记录真实退出码。重导出会更新已有 tiny 产物，保留旧证据前请另行备份；不要覆盖 real 产品目录。
 
 ```bash
-cd /Users/bojunjin/Documents/LLM/qwen3-omni-onnx-work
+set -e
 source .venv/bin/activate
-
-echo "=== [1] 编译与源码 ==="
-python -m py_compile *.py && echo "compile OK"
-python -c "from qwen3_omni_onnx_cases import assert_transformers_provenance as f; print(f())"
-
-echo "=== [2] 全链路 ==="
-python run_local_thinking_pipeline.py 2>/dev/null | grep -E "^\[OK\]|^\[FAIL\]" | tail -8
-
-echo "=== [3] 早期三级回归 ==="
+python -B -m unittest discover -s tests -v
+python run_local_thinking_pipeline.py
 for c in rmsnorm moe_block tiny_thinker; do
-  python validate_onnx.py --case "$c" --model "artifacts/$c/model.onnx" >/dev/null 2>&1 \
-    && echo "$c OK" || echo "$c FAIL"
+  python export_onnx.py --case "$c" --output-dir "artifacts/$c" --force
+  python validate_onnx.py --case "$c" --model "artifacts/$c/model.onnx"
+  python inspect_onnx.py --model "artifacts/$c/model.onnx" --fail-on-custom-domain
 done
-
-echo "=== [4] 反向测试（前 4 项应为 1，最后 1 项应为 0） ==="
-rm -rf artifacts/_tamper
-cp -r Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/thinker_prefill artifacts/_tamper
-printf 'x' | dd of=artifacts/_tamper/model.onnx bs=1 seek=200 conv=notrunc status=none
-python validate_onnx.py --model artifacts/_tamper/model.onnx            >/dev/null 2>&1; echo "篡改ONNX   退出码=$?"
-python validate_onnx.py --model artifacts/rmsnorm/model.onnx --atol inf  >/dev/null 2>&1; echo "atol=inf   退出码=$?"
-python export_onnx.py --case rmsnorm --output-dir . --force              >/dev/null 2>&1; echo "force越界  退出码=$?"
-python validate_onnx.py --case rmsnorm --model Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/thinker_prefill/model.onnx >/dev/null 2>&1; echo "case传错   退出码=$?"
-python validate_onnx.py --model artifacts/rmsnorm/model.onnx             >/dev/null 2>&1; echo "正常验证   退出码=$?"
-rm -rf artifacts/_tamper
 ```
+
+反向场景使用 `tests/test_*.py` 的持久 unittest，在临时隔离目录验证，不需要照抄历史 `rm -rf/dd` 操作。`--case` 调用错误应保留有效旧报告；产物身份或绑定失效应阻止旧报告继续被采信。具体覆盖以本轮真实 unittest 输出为准。
+
+BF16、整数和布尔张量须按真实 dtype 校验：例如 Vision `position_indices=int32`，Text 两种位置 mask 为 `bool`，Audio `cu_seqlens=int32`。不能把全部张量 cast 为 float32 来凑数值通过。逐组件接口见 `README.md` 第 6 节。
 
 ---
 

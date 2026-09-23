@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
+import math
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import onnx
 import psutil
 import torch
 
+from export_onnx import export_transaction
+from onnx_artifact_utils import model_identity, safe_path, save_tensor_archive, source_snapshot
 from qwen3_omni_onnx_cases import (
     DEFAULT_SEED,
     WORKSPACE,
@@ -53,24 +56,26 @@ def parse_args() -> argparse.Namespace:
 
 
 def estimate_weight_bytes(checkpoint_path: Path) -> int:
-    """估算官方 checkpoint 的权重总字节数；索引缺失字段时改用磁盘上的分片实际大小。"""
+    """估算已索引 checkpoint 的权重总字节数；声明值非法或分片缺失时直接失败。"""
     index_path = checkpoint_path / "model.safetensors.index.json"
-    if index_path.is_file():
-        index = json.loads(index_path.read_text(encoding="utf-8"))
-        declared = int(index.get("metadata", {}).get("total_size", 0))
-        if declared:
-            return declared
-        shard_names = sorted(set(index.get("weight_map", {}).values()))
-    else:
-        shard_names = ["model.safetensors"]
+    if not index_path.is_file():
+        raise FileNotFoundError(
+            f"官方 checkpoint 必须包含 model.safetensors.index.json：{index_path}（不支持未索引的单文件权重）"
+        )
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    declared = index.get("metadata", {}).get("total_size")
+    shard_names = sorted(set(index.get("weight_map", {}).values()))
+    if not shard_names:
+        raise ValueError("权重索引中没有 safetensors shard")
     total = 0
     for name in shard_names:
         shard = checkpoint_path / name
-        if shard.is_file():
-            total += shard.stat().st_size
-    if not total:
-        raise RuntimeError(f"无法估算权重体积：{checkpoint_path}（既无 index 元数据也无可用权重分片）")
-    return total
+        if not shard.is_file() or shard.stat().st_size == 0:
+            raise FileNotFoundError(f"权重分片缺失或为空：{shard}")
+        total += shard.stat().st_size
+    if isinstance(declared, bool) or not isinstance(declared, int) or declared <= 0 or declared > total:
+        raise ValueError(f"索引声明的 total_size={declared!r} 非法或超过分片实际总字节 {total}")
+    return declared
 
 
 def invalidate_package_evidence(package_dir: Path) -> None:
@@ -85,29 +90,20 @@ def invalidate_package_evidence(package_dir: Path) -> None:
             stale.unlink()
 
 
-def safe_component_dir(package_dir: Path, component: str, force: bool) -> Path:
-    package_dir = package_dir.expanduser().resolve()
-    workspace = WORKSPACE.resolve()
-    try:
-        package_dir.relative_to(workspace)
-    except ValueError as error:
-        raise ValueError(f"产品目录必须位于工作区 {workspace} 内") from error
-    if package_dir == workspace:
+def resolve_package_dir(package_dir: Path) -> Path:
+    package_dir = safe_path(WORKSPACE, package_dir)
+    if package_dir == WORKSPACE:
         raise ValueError("产品目录不能是工作区根目录")
-    output_dir = package_dir / "onnx" / component
-    resolved_output = output_dir.resolve()
-    try:
-        resolved_output.relative_to(package_dir)
-    except ValueError as error:
-        raise ValueError(f"输出目录经符号链接解析后越出产品目录：{output_dir}") from error
-    for candidate in (package_dir, package_dir / "onnx", output_dir):
+    for candidate in (package_dir, package_dir / "onnx", package_dir / "validation", package_dir / "operators"):
         if candidate.exists() and candidate.is_symlink():
             raise ValueError(f"拒绝符号链接路径：{candidate}")
-    if output_dir.exists() and any(output_dir.iterdir()):
-        if not force:
-            raise FileExistsError(f"{output_dir} 非空；如需覆盖请添加 --force")
-        shutil.rmtree(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    return package_dir
+
+
+def check_component_dir(package_dir: Path, component: str, force: bool) -> Path:
+    output_dir = safe_path(package_dir, package_dir / "onnx" / component)
+    if output_dir.exists() and any(output_dir.iterdir()) and not force:
+        raise FileExistsError(f"{output_dir} 非空；如需覆盖请添加 --force")
     return output_dir
 
 
@@ -117,6 +113,7 @@ def export_component(
     opset: int,
     seed: int,
     profile: str,
+    snapshot: dict[str, Any],
 ) -> dict:
     model_path = output_dir / "model.onnx"
     case.model.requires_grad_(False)
@@ -128,8 +125,10 @@ def export_component(
             reference = normalize_outputs(case.model(*vector))
         input_name = f"inputs_{index}.npz"
         reference_name = f"reference_outputs_{index}.npz"
-        np.savez(output_dir / input_name, **tensor_dict(case.input_names, vector))
-        np.savez(output_dir / reference_name, **tensor_dict(case.output_names, reference))
+        input_dtypes = save_tensor_archive(output_dir / input_name, tensor_dict(case.input_names, vector))
+        reference_dtypes = save_tensor_archive(
+            output_dir / reference_name, tensor_dict(case.output_names, reference)
+        )
         routing = component_routing(case.model, vector)
         if routing:
             routing_hashes.add(routing["sha256"])
@@ -140,6 +139,8 @@ def export_component(
                 "reference_output_file": reference_name,
                 "input_sha256": file_sha256(output_dir / input_name),
                 "reference_output_sha256": file_sha256(output_dir / reference_name),
+                "input_dtypes": input_dtypes,
+                "reference_output_dtypes": reference_dtypes,
                 "routing": routing,
             }
         )
@@ -166,9 +167,15 @@ def export_component(
     onnx.checker.check_model(str(model_path), full_check=True)
     graph = onnx.load(str(model_path), load_external_data=False)
 
+    identity = model_identity(model_path)
+    if source_snapshot()["files"] != snapshot["files"]:
+        raise RuntimeError("导出期间工具源码发生变化，拒绝写入可能不对应的导出元数据")
     metadata = {
+        "evidence_schema_version": 2,
         "case": case.name,
         "product_component": case.name,
+        "model_identity": identity,
+        "source_snapshot": snapshot,
         "profile": profile,
         "official_weights_included": profile.startswith("real-"),
         "randomly_initialized": profile.startswith("tiny-"),
@@ -202,11 +209,18 @@ def main() -> None:
     if args.opset < 18:
         raise ValueError("Dynamo ONNX exporter 要求本流程使用 opset >= 18")
     components = THINKING_COMPONENTS if args.component == "all" else (args.component,)
+    package_dir = resolve_package_dir(args.package_dir)
+    evidence = tuple(package_dir / name for name in (
+        "manifest.json", "validation/end_to_end.json", "operators/summary.json", "operators/all_operators.csv",
+    ))
 
     full_model = None
     if args.mode == "real":
         if args.model_path is None:
             raise ValueError("real 模式必须提供 --model-path")
+        if not (isinstance(args.minimum_memory_gib, float) and math.isfinite(args.minimum_memory_gib)
+                and args.minimum_memory_gib > 0):
+            raise ValueError(f"--minimum-memory-gib 必须为有限正数，实际为 {args.minimum_memory_gib}")
         memory = psutil.virtual_memory()
         total_memory_gib = memory.total / 1024**3
         available_memory_gib = memory.available / 1024**3
@@ -236,21 +250,26 @@ def main() -> None:
         dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
         full_model = load_real_thinking_model(str(checkpoint_path), dtype=dtype, device=args.device)
 
-    # 先确认目标目录可写（非空时必须 --force），再失效化全局证据：
-    # 顺序反过来会出现“证据已删、模型一个都没换”的损坏中间态。
-    package_dir = args.package_dir.expanduser().resolve()
-    for component in components:
-        safe_component_dir(package_dir, component, args.force)
-    invalidate_package_evidence(package_dir)
+    snapshot = source_snapshot()
+    profile = f"{args.mode}-fixed-shape"
 
-    for component in components:
+    def export_one(name: str, staging: Path) -> None:
         case = (
-            build_tiny_thinking_component(component, args.seed)
+            build_tiny_thinking_component(name, args.seed)
             if args.mode == "tiny"
-            else build_real_thinking_component(full_model, component, args.seed)
+            else build_real_thinking_component(full_model, name, args.seed)
         )
-        output_dir = safe_component_dir(package_dir, component, args.force)
-        export_component(case, output_dir, args.opset, args.seed, f"{args.mode}-fixed-shape")
+        export_component(case, staging, args.opset, args.seed, profile, snapshot)
+
+    # 先在暂存目录导出并通过 Checker，全部成功后再整体替换旧产物并失效化旧全局证据；
+    # 任何失败都会回滚，旧 ONNX 与旧证据保持原样。
+    export_transaction(
+        {name: check_component_dir(package_dir, name, args.force) for name in components},
+        args.force,
+        export_one,
+        evidence=evidence,
+        lock_root=package_dir,
+    )
 
 
 if __name__ == "__main__":

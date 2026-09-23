@@ -4,7 +4,9 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -28,6 +30,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     eager_attention_forward,
 )
 
+from onnx_artifact_utils import safe_path
 from qwen3_omni_onnx_cases import (
     DEFAULT_SEED,
     assert_transformers_provenance,
@@ -53,6 +56,7 @@ class ThinkingComponentCase:
     source_equivalence: dict[str, Any] | None = None
     dynamic_shapes: Any | None = None
     checkpoint_fingerprint: dict[str, Any] | None = None
+    raw_reference_inputs: tuple[torch.Tensor, ...] | None = None
 
     @property
     def export_args(self) -> tuple[torch.Tensor, ...]:
@@ -107,9 +111,8 @@ class VisionEncoderExportWrapper(nn.Module):
         attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         hidden_states = self.vision.patch_embed(pixel_values)
-        position_embeddings = (
-            self.vision.pos_embed(position_indices) * position_weights[:, :, None]
-        ).sum(dim=0)
+        corners = self.vision.pos_embed(position_indices) * position_weights[:, :, None]
+        position_embeddings = corners[0] + corners[1] + corners[2] + corners[3]
         hidden_states = hidden_states + position_embeddings.to(hidden_states.dtype)
 
         deepstack: list[torch.Tensor] = []
@@ -479,11 +482,18 @@ def _prefill_inputs(
 ) -> tuple[torch.Tensor, ...]:
     input_ids = torch.tensor([token_ids], dtype=torch.int64)
     sequence = input_ids.shape[1]
-    vision_positions = vision_positions or [1, 2, 3, 4]
-    audio_positions = audio_positions or [5, 6, 7]
+    if vision_positions is None or audio_positions is None:
+        raise ValueError("必须显式提供由 token placeholder 导出的视觉和音频位置")
     all_multimodal_positions = [*vision_positions, *audio_positions]
-    if not all_multimodal_positions or max(all_multimodal_positions) >= sequence:
-        raise ValueError("多模态 placeholder 位置超出 Prefill 序列")
+    if (
+        not all_multimodal_positions
+        or min(all_multimodal_positions) < 0
+        or max(all_multimodal_positions) >= sequence
+        or len(set(all_multimodal_positions)) != len(all_multimodal_positions)
+        or vision_positions != sorted(vision_positions)
+        or audio_positions != sorted(audio_positions)
+    ):
+        raise ValueError("多模态 placeholder 位置必须有序、唯一且位于 Prefill 序列内")
     attention_mask = torch.ones_like(input_ids)
     cache_position = torch.arange(sequence, dtype=torch.int64)
     if position_ids is None:
@@ -519,69 +529,111 @@ def _prefill_inputs(
     )
 
 
-def reference_prefill(
-    text_model: Qwen3OmniMoeThinkerTextModel,
-    lm_head: nn.Linear,
-    args: tuple[torch.Tensor, ...],
-    deepstack_count: int,
+def assert_prefill_contract(
+    args: tuple[torch.Tensor, ...], config: Qwen3OmniMoeThinkerConfig, deepstack_count: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    input_ids, _, _, _, embeddings, multimodal_mask, visual_mask, *deepstack = args
+    image_mask = input_ids == config.image_token_id
+    audio_mask = input_ids == config.audio_token_id
+    if bool((input_ids == config.video_token_id).any()):
+        raise ValueError("该 image/audio Prefill profile 不接受 video placeholder")
+    if multimodal_mask.dtype != torch.bool or not torch.equal(multimodal_mask, image_mask | audio_mask):
+        raise ValueError("multimodal_mask 必须严格对应 image/audio token placeholder")
+    if visual_mask.dtype != torch.bool or not torch.equal(visual_mask, image_mask):
+        raise ValueError("visual_position_mask 必须严格对应 image token placeholder")
+    if embeddings.shape != (*input_ids.shape, config.text_config.hidden_size):
+        raise ValueError("多模态 embedding 形状不匹配")
+    if len(deepstack) != deepstack_count or any(
+        value.shape != (int(image_mask.sum()), config.text_config.hidden_size) for value in deepstack
+    ):
+        raise ValueError("DeepStack 层数或按 placeholder 顺序排列的行数不匹配")
+    return image_mask, audio_mask
+
+
+def inject_multimodal_features(
+    template: tuple[torch.Tensor, ...],
+    config: Qwen3OmniMoeThinkerConfig,
+    vision: tuple[torch.Tensor, ...],
+    audio: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, ...]:
-    (
-        input_ids,
-        attention_mask,
-        position_ids,
-        cache_position,
-        multimodal_embeddings,
-        multimodal_mask,
-        visual_position_mask,
-        *deepstack,
-    ) = args
-    token_embeddings = text_model.embed_tokens(input_ids)
-    inputs_embeds = torch.where(
-        multimodal_mask.unsqueeze(-1),
-        multimodal_embeddings.to(token_embeddings.dtype),
-        token_embeddings,
-    )
-    cache = DynamicCache(config=text_model.config)
-    outputs = text_model(
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=cache,
-        use_cache=True,
-        cache_position=cache_position,
-        visual_pos_masks=visual_position_mask,
-        deepstack_visual_embeds=list(deepstack[:deepstack_count]),
-    )
-    flattened: list[torch.Tensor] = [lm_head(outputs.last_hidden_state)]
+    image_mask, audio_mask = assert_prefill_contract(template, config, len(vision) - 1)
+    if len(audio) != 1 or vision[0].shape != template[4][image_mask].shape or audio[0].shape != template[4][audio_mask].shape:
+        raise ValueError("视觉/音频特征数量必须与各自 placeholder 数量完全一致")
+    embeddings = torch.zeros_like(template[4])
+    embeddings[image_mask] = vision[0].to(embeddings)
+    embeddings[audio_mask] = audio[0].to(embeddings)
+    result = (*template[:4], embeddings, image_mask | audio_mask, image_mask, *vision[1:])
+    assert_prefill_contract(result, config, len(vision) - 1)
+    torch.testing.assert_close(embeddings[image_mask], vision[0].to(embeddings), rtol=0, atol=0)
+    torch.testing.assert_close(embeddings[audio_mask], audio[0].to(embeddings), rtol=0, atol=0)
+    for actual, expected in zip(result[7:], vision[1:]):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    return result
+
+
+def flatten_thinker_output(outputs: Any) -> tuple[torch.Tensor, ...]:
+    flattened = [outputs.logits]
     for layer in outputs.past_key_values.layers:
         flattened.extend((layer.keys, layer.values))
     return tuple(flattened)
+
+
+def reference_prefill(
+    thinker: Qwen3OmniMoeThinkerForConditionalGeneration,
+    args: tuple[torch.Tensor, ...],
+    deepstack_count: int,
+    vision_grid: tuple[int, int, int],
+    audio_feature_length: int,
+) -> tuple[torch.Tensor, ...]:
+    """Official top-level forward; only the expensive feature extraction interfaces are stubbed."""
+    image_mask, audio_mask = assert_prefill_contract(args, thinker.config, deepstack_count)
+    input_ids, attention_mask, _, _, embeddings, _, _, *deepstack = args
+    image_outputs = SimpleNamespace(pooler_output=embeddings[image_mask], deepstack_features=deepstack)
+    audio_outputs = SimpleNamespace(last_hidden_state=embeddings[audio_mask])
+    feature_mask = torch.ones((1, audio_feature_length), dtype=torch.int64, device=input_ids.device)
+    with patch.object(thinker, "get_image_features", return_value=image_outputs), patch.object(
+        thinker, "get_audio_features", return_value=audio_outputs
+    ):
+        outputs = thinker(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=embeddings.new_empty(0),
+            image_grid_thw=torch.tensor([vision_grid], dtype=torch.int64, device=input_ids.device),
+            input_features=embeddings.new_empty(0),
+            feature_attention_mask=feature_mask,
+            use_cache=True,
+            return_dict=True,
+        )
+    return flatten_thinker_output(outputs)
 
 
 def reference_decode(
-    text_model: Qwen3OmniMoeThinkerTextModel,
-    lm_head: nn.Linear,
-    args: tuple[torch.Tensor, ...],
+    thinker: Qwen3OmniMoeThinkerForConditionalGeneration,
+    input_ids: torch.Tensor,
+    flat_cache: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, ...]:
-    input_ids, attention_mask, position_ids, cache_position, *flat_cache = args
-    cache = DynamicCache(
-        ddp_cache_data=[
-            (flat_cache[2 * index], flat_cache[2 * index + 1])
-            for index in range(len(text_model.layers))
-        ]
+    """Advance only the reference cache, using the official prefill's own rope_deltas."""
+    if thinker.rope_deltas is None:
+        raise ValueError("参考 Decode 必须先运行独立官方 Prefill 以建立 rope_deltas")
+    if len(flat_cache) != len(thinker.model.layers) * 2:
+        raise ValueError("参考 Decode K/V 数量不匹配")
+    cache = DynamicCache(ddp_cache_data=list(zip(flat_cache[::2], flat_cache[1::2])))
+    attention_mask = torch.ones(
+        input_ids.shape[0], cache.get_seq_length() + input_ids.shape[1], dtype=torch.int64, device=input_ids.device
     )
-    outputs = text_model(
+    outputs = thinker(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        position_ids=position_ids,
         past_key_values=cache,
         use_cache=True,
-        cache_position=cache_position,
+        return_dict=True,
     )
-    flattened: list[torch.Tensor] = [lm_head(outputs.last_hidden_state)]
-    for layer in outputs.past_key_values.layers:
-        flattened.extend((layer.keys, layer.values))
-    return tuple(flattened)
+    return flatten_thinker_output(outputs)
+
+
+def decode_position_ids(past_length: int, rope_delta: torch.Tensor, device: torch.device) -> torch.Tensor:
+    delta = rope_delta.to(device=device, dtype=torch.float32).reshape(1, -1, 1)
+    return (delta + past_length).expand(3, -1, 1).contiguous()
 
 
 def _assert_close_tuple(actual: tuple[torch.Tensor, ...], expected: tuple[torch.Tensor, ...], label: str) -> float:
@@ -646,6 +698,7 @@ def build_tiny_thinking_component(component: str, seed: int = DEFAULT_SEED) -> T
                 "host_preprocessing": True,
             },
             source_equivalence={"checked": True, "max_abs_error": error},
+            raw_reference_inputs=(first_pixels.clone(), grids[0].clone()),
         )
 
     if component == "audio_encoder":
@@ -680,10 +733,13 @@ def build_tiny_thinking_component(component: str, seed: int = DEFAULT_SEED) -> T
                 "chunk_count": int(vectors[0][0].shape[0]),
             },
             source_equivalence={"checked": True, "max_abs_error": error},
+            raw_reference_inputs=(first_features.clone(), feature_lens.clone()),
         )
 
     config, text_model, lm_head = _make_tiny_text_modules(seed)
     position_helper = Qwen3OmniMoeThinkerForConditionalGeneration(make_tiny_thinker_config()).eval()
+    position_helper.model = text_model
+    position_helper.lm_head = lm_head
     vision_grid = (1, 4, 4)
     audio_feature_length = 20
     first_prompt = build_multimodal_prompt(position_helper, 12, vision_grid, audio_feature_length, 0)
@@ -717,7 +773,7 @@ def build_tiny_thinking_component(component: str, seed: int = DEFAULT_SEED) -> T
         with torch.inference_mode():
             for vector in vectors:
                 wrapped = normalize_outputs(wrapper(*vector))
-                reference = reference_prefill(text_model, lm_head, vector, deepstack_count=1)
+                reference = reference_prefill(position_helper, vector, 1, vision_grid, audio_feature_length)
                 equivalence_errors.append(_assert_close_tuple(wrapped, reference, "Thinker Prefill wrapper"))
         return ThinkingComponentCase(
             name=component,
@@ -742,7 +798,12 @@ def build_tiny_thinking_component(component: str, seed: int = DEFAULT_SEED) -> T
                 "mrope_source": "Qwen3OmniMoeThinkerForConditionalGeneration.get_rope_index",
                 "rope_deltas": [float(first_prompt[4].item()), float(second_prompt[4].item())],
             },
-            source_equivalence={"checked": True, "max_abs_error": max(equivalence_errors)},
+            source_equivalence={
+                "checked": True,
+                "scope": "official_top_level_with_precomputed_features" if component.startswith("thinker_") else "official_encoder_forward",
+                "experts_reference": "official_batched_mm; real eager low-precision equivalence not established",
+                "max_abs_error": max(equivalence_errors),
+            },
         )
 
     prefill = ThinkerPrefillExportWrapper(text_model, lm_head, deepstack_count=1).eval()
@@ -776,9 +837,7 @@ def build_tiny_thinking_component(component: str, seed: int = DEFAULT_SEED) -> T
         next_token = torch.tensor([[6 + index]], dtype=torch.int64)
         past_length = prefill_input[0].shape[1]
         decode_mask = torch.ones(1, past_length + 1, dtype=torch.int64)
-        decode_position_value = past_length + int(rope_delta.item())
-        # 与 Prefill 保持一致：Prefill 的 position_ids 来自官方 get_rope_index，是 float32
-        decode_position = torch.full((3, 1, 1), decode_position_value, dtype=torch.float32)
+        decode_position = decode_position_ids(past_length, rope_delta, next_token.device)
         decode_cache_position = torch.tensor([past_length], dtype=torch.int64)
         decode_vectors.append(
             (next_token, decode_mask, decode_position, decode_cache_position, *prefill_output[1:])
@@ -790,9 +849,10 @@ def build_tiny_thinking_component(component: str, seed: int = DEFAULT_SEED) -> T
         output_names.extend((f"present_key_{layer_index}", f"present_value_{layer_index}"))
     equivalence_errors = []
     with torch.inference_mode():
-        for vector in decode_vectors:
+        for vector, prefill_input in zip(decode_vectors, prefill_vectors):
             wrapped = normalize_outputs(decode(*vector))
-            reference = reference_decode(text_model, lm_head, vector)
+            official_prefill = reference_prefill(position_helper, prefill_input, 1, vision_grid, audio_feature_length)
+            reference = reference_decode(position_helper, vector[0], official_prefill[1:])
             equivalence_errors.append(_assert_close_tuple(wrapped, reference, "Thinker Decode wrapper"))
     return ThinkingComponentCase(
         name=component,
@@ -808,7 +868,12 @@ def build_tiny_thinking_component(component: str, seed: int = DEFAULT_SEED) -> T
             "decode_sequence": 1,
             "cache_tensors": config.num_hidden_layers * 2,
         },
-        source_equivalence={"checked": True, "max_abs_error": max(equivalence_errors)},
+        source_equivalence={
+            "checked": True,
+            "scope": "official_top_level_with_precomputed_features" if component.startswith("thinker_") else "official_encoder_forward",
+            "experts_reference": "official_batched_mm; real eager low-precision equivalence not established",
+            "max_abs_error": max(equivalence_errors),
+        },
         dynamic_shapes=make_decode_dynamic_shapes(config.num_hidden_layers, max_past_length=64),
     )
 
@@ -819,8 +884,8 @@ def component_routing(model: nn.Module, args: tuple[torch.Tensor, ...]) -> dict[
 
 def fingerprint_checkpoint(model_path: Path) -> dict[str, Any]:
     model_path = model_path.expanduser().resolve()
-    config_path = model_path / "config.json"
-    index_path = model_path / "model.safetensors.index.json"
+    config_path = safe_path(model_path, model_path / "config.json", must_exist=True)
+    index_path = safe_path(model_path, model_path / "model.safetensors.index.json", must_exist=True)
     if not config_path.is_file() or not index_path.is_file():
         raise FileNotFoundError("官方 checkpoint 必须包含 config.json 和 model.safetensors.index.json")
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -832,8 +897,7 @@ def fingerprint_checkpoint(model_path: Path) -> dict[str, Any]:
         raise ValueError("权重索引中没有 safetensors shard")
     shards = []
     for name in shard_names:
-        path = (model_path / name).resolve()
-        path.relative_to(model_path)
+        path = safe_path(model_path, model_path / name, must_exist=True)
         if not path.is_file() or path.stat().st_size == 0:
             raise FileNotFoundError(f"权重分片缺失或为空：{path}")
         shards.append({"name": name, "bytes": path.stat().st_size, "sha256": file_sha256(path)})
@@ -936,8 +1000,14 @@ def build_real_thinking_component(
             description="官方权重 Thinking Vision Encoder",
             config=vision.config.to_dict(),
             interface={"grid_profile": list(vision_grid), "host_preprocessing": True},
-            source_equivalence={"checked": True, "max_abs_error": max(equivalence_errors)},
+            source_equivalence={
+                "checked": True,
+                "scope": "official_top_level_with_precomputed_features" if component.startswith("thinker_") else "official_encoder_forward",
+                "experts_reference": "official_batched_mm; real eager low-precision equivalence not established",
+                "max_abs_error": max(equivalence_errors),
+            },
             checkpoint_fingerprint=getattr(full_model, "_onnx_checkpoint_provenance", None),
+            raw_reference_inputs=(first.clone(), grid.to(vision.device).clone()),
         )
 
     if component == "audio_encoder":
@@ -970,8 +1040,14 @@ def build_real_thinking_component(
                 "host_preprocessing": True,
                 "chunk_count": int(vectors[0][0].shape[0]),
             },
-            source_equivalence={"checked": True, "max_abs_error": max(equivalence_errors)},
+            source_equivalence={
+                "checked": True,
+                "scope": "official_top_level_with_precomputed_features" if component.startswith("thinker_") else "official_encoder_forward",
+                "experts_reference": "official_batched_mm; real eager low-precision equivalence not established",
+                "max_abs_error": max(equivalence_errors),
+            },
             checkpoint_fingerprint=getattr(full_model, "_onnx_checkpoint_provenance", None),
+            raw_reference_inputs=(first.clone(), feature_lens.clone()),
         )
 
     text_model = thinker.model.eval()
@@ -1064,7 +1140,7 @@ def build_real_thinking_component(
         with torch.inference_mode():
             for vector in vectors:
                 wrapped = normalize_outputs(wrapper(*vector))
-                reference = reference_prefill(text_model, lm_head, vector, deepstack_count)
+                reference = reference_prefill(thinker, vector, deepstack_count, vision_grid, audio_feature_length)
                 equivalence_errors.append(_assert_close_tuple(wrapped, reference, "Real Thinker Prefill wrapper"))
         return ThinkingComponentCase(
             name=component,
@@ -1082,7 +1158,8 @@ def build_real_thinking_component(
             },
             source_equivalence={
                 "checked": True,
-                "scope": "official_mrope_and_text_backbone",
+                "scope": "official_top_level_with_precomputed_features",
+                "experts_reference": "official_batched_mm; real eager low-precision equivalence not established",
                 "max_abs_error": max(equivalence_errors),
             },
             checkpoint_fingerprint=getattr(full_model, "_onnx_checkpoint_provenance", None),
@@ -1124,8 +1201,7 @@ def build_real_thinking_component(
         next_token = torch.tensor([[6 + index]], dtype=torch.int64, device=text_model.device)
         past_length = prefill_input[0].shape[1]
         decode_mask = torch.ones(1, past_length + 1, dtype=torch.int64, device=text_model.device)
-        decode_position_value = past_length + int(rope_delta.item())
-        decode_position = torch.full((3, 1, 1), decode_position_value, dtype=torch.int64, device=text_model.device)
+        decode_position = decode_position_ids(past_length, rope_delta, text_model.device)
         decode_cache_position = torch.tensor([past_length], dtype=torch.int64, device=text_model.device)
         decode_vectors.append(
             (next_token, decode_mask, decode_position, decode_cache_position, *prefill_output[1:])
@@ -1137,9 +1213,10 @@ def build_real_thinking_component(
         output_names.extend((f"present_key_{layer_index}", f"present_value_{layer_index}"))
     equivalence_errors = []
     with torch.inference_mode():
-        for vector in decode_vectors:
+        for vector, prefill_input in zip(decode_vectors, prefill_vectors):
             wrapped = normalize_outputs(decode(*vector))
-            reference = reference_decode(text_model, lm_head, vector)
+            official_prefill = reference_prefill(thinker, prefill_input, deepstack_count, vision_grid, audio_feature_length)
+            reference = reference_decode(thinker, vector[0], official_prefill[1:])
             equivalence_errors.append(_assert_close_tuple(wrapped, reference, "Real Thinker Decode wrapper"))
     return ThinkingComponentCase(
         name=component,
@@ -1155,7 +1232,12 @@ def build_real_thinking_component(
             "decode_sequence": 1,
             "cache_tensors": text_config.num_hidden_layers * 2,
         },
-        source_equivalence={"checked": True, "max_abs_error": max(equivalence_errors)},
+        source_equivalence={
+            "checked": True,
+            "scope": "official_top_level_with_precomputed_features" if component.startswith("thinker_") else "official_encoder_forward",
+            "experts_reference": "official_batched_mm; real eager low-precision equivalence not established",
+            "max_abs_error": max(equivalence_errors),
+        },
         dynamic_shapes=make_decode_dynamic_shapes(
             text_config.num_hidden_layers,
             max_past_length=text_config.max_position_embeddings - 1,

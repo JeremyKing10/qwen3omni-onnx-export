@@ -1,0 +1,37 @@
+{
+  "name": "onnx-audit-fixes",
+  "mainConversationId": "c02659b7e8644c5980e1f6587f90a518",
+  "workspacePath": "/Users/bojunjin/Documents/LLM/qwen3-omni-onnx-work",
+  "createdAt": "2026-09-23T02:53:55.031Z",
+  "options": {
+    "workspacePath": "/Users/bojunjin/Documents/LLM/qwen3-omni-onnx-work",
+    "isAutoTeam": false
+  },
+  "isAutoTeam": false,
+  "members": [
+    {
+      "memberId": "semantics@onnx-audit-fixes",
+      "name": "semantics",
+      "role": "实现独立语义参考和端到端修复",
+      "sessionId": "9b72fe598d94457487b0273ead5d759e"
+    },
+    {
+      "memberId": "export-safety@onnx-audit-fixes",
+      "name": "export-safety",
+      "role": "实现导出事务和一键前置检查",
+      "sessionId": "ec799075013447c4a099e80ff4978384"
+    },
+    {
+      "memberId": "packaging@onnx-audit-fixes",
+      "name": "packaging",
+      "role": "实现严格打包和可迁移证据",
+      "sessionId": "b5886af453f140c78255d840fa9b90f9"
+    },
+    {
+      "memberId": "docs@onnx-audit-fixes",
+      "name": "docs",
+      "role": "订正文档和迁移扩展说明",
+      "sessionId": "e91a03953c604de5bf4e36e5660d5907"
+    }
+  ]
+}

@@ -13,8 +13,12 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 
-from qwen3_omni_onnx_cases import SUPPORTED_CASES, file_sha256, write_json
+from qwen3_omni_onnx_cases import SUPPORTED_CASES, WORKSPACE, file_sha256, write_json
 from qwen3_omni_thinking_components import THINKING_COMPONENTS
+from onnx_artifact_utils import (
+    artifact_identity, check_providers, load_tensor_archive, run_ort_session,
+    safe_path, validate_tolerances, verify_artifact_identity,
+)
 
 KNOWN_CASES = tuple(SUPPORTED_CASES) + tuple(THINKING_COMPONENTS)
 
@@ -48,9 +52,9 @@ def finite_and_error(actual: np.ndarray, expected: np.ndarray) -> dict[str, Any]
     shape_match = actual.shape == expected.shape
     dtype_match = actual.dtype == expected.dtype
     finite = bool(np.isfinite(actual).all() and np.isfinite(expected).all())
-    if not shape_match:
+    if not shape_match or not finite:
         return {
-            "shape_match": False,
+            "shape_match": shape_match,
             "dtype_match": dtype_match,
             "actual_shape": list(actual.shape),
             "expected_shape": list(expected.shape),
@@ -107,17 +111,15 @@ def validate_vector(
     rtol: float,
     atol: float,
 ) -> dict[str, Any]:
-    inputs_path = (model_dir / vector["input_file"]).resolve()
-    reference_path = (model_dir / vector["reference_output_file"]).resolve()
+    inputs_path = safe_path(model_dir, model_dir / vector["input_file"], must_exist=True)
+    reference_path = safe_path(model_dir, model_dir / vector["reference_output_file"], must_exist=True)
     if file_sha256(inputs_path) != vector["input_sha256"]:
         raise RuntimeError(f"输入文件哈希不匹配：{inputs_path}")
     if file_sha256(reference_path) != vector["reference_output_sha256"]:
         raise RuntimeError(f"参考输出哈希不匹配：{reference_path}")
 
-    with np.load(inputs_path) as loaded_inputs:
-        available_inputs = {name: loaded_inputs[name] for name in loaded_inputs.files}
-    with np.load(reference_path) as loaded_reference:
-        references = {name: loaded_reference[name] for name in loaded_reference.files}
+    available_inputs = load_tensor_archive(inputs_path, vector.get("input_dtypes"))
+    references = load_tensor_archive(reference_path, vector.get("reference_output_dtypes"))
 
     if set(available_inputs) != expected_inputs:
         raise KeyError(f"输入名称不一致：NPZ={sorted(available_inputs)} ONNX={sorted(expected_inputs)}")
@@ -125,7 +127,7 @@ def validate_vector(
         raise KeyError(f"输出名称不一致：参考={sorted(references)} ONNX={sorted(expected_outputs)}")
 
     output_names = [item.name for item in session.get_outputs()]
-    actual_outputs = session.run(output_names, available_inputs)
+    actual_outputs = run_ort_session(session, available_inputs, output_names)
     comparisons: dict[str, dict[str, Any]] = {}
     vector_passed = True
     for name, actual in zip(output_names, actual_outputs):
@@ -167,35 +169,31 @@ def write_failure(report_path: Path, model_path: Path, error: BaseException, sta
 
 def main() -> None:
     args = parse_args()
-    validate_tolerance("rtol", args.rtol)
-    validate_tolerance("atol", args.atol)
-
-    model_path = args.model.expanduser().resolve()
+    validate_tolerances(args.rtol, args.atol)
+    requested_providers = args.providers or ["CPUExecutionProvider"]
+    check_providers(requested_providers)
+    model_path = safe_path(WORKSPACE, args.model, must_exist=True)
     model_dir = model_path.parent
-    report_path = model_dir / "validation.json"
+    diagnostic = args.skip_shape_inference or args.rtol > 1e-4 or args.atol > 1e-5
+    report_path = safe_path(WORKSPACE, model_dir / ("validation.diagnostic.json" if diagnostic else "validation.json"))
+    failure_path = safe_path(WORKSPACE, model_dir / "validation.failure.json")
     started = time.perf_counter()
-
-    # 身份校验（case / 模型哈希）必须在动任何报告之前完成。
-    # --case 传错属于调用方式错误，不能因此覆盖掉该模型原有的有效验证报告。
-    if not model_path.is_file():
-        raise FileNotFoundError(model_path)
     metadata = load_metadata(model_dir)
     if args.case and metadata["case"] != args.case:
         raise ValueError(f"case 不一致：参数={args.case} 元数据={metadata['case']}")
-    model_hash = file_sha256(model_path)
-    if model_hash != metadata["model_sha256"]:
-        # 文件已被替换/篡改，旧报告对新文件不再成立，必须失效化再写失败报告。
-        error = RuntimeError("ONNX 文件哈希与导出元数据不一致")
-        report_path.unlink(missing_ok=True)
-        write_failure(report_path, model_path, error, started)
-        raise error
-
-    report_path.unlink(missing_ok=True)
+    identity = artifact_identity(model_path)
+    protected = {model_path, model_dir / "export_metadata.json"}
+    protected.update(model_dir / item["location"] for item in identity["external_data"])
+    protected.update(model_dir / vector[field] for vector in identity["test_vectors"]
+                     for field in ("input_file", "reference_output_file"))
+    if report_path in protected or failure_path in protected:
+        raise ValueError("验证报告路径与模型、external data 或测试向量冲突")
+    model_hash = identity["model_sha256"]
     try:
         onnx.checker.check_model(str(model_path), full_check=True)
         shape_inference: dict[str, Any] = {
             "attempted": not args.skip_shape_inference,
-            "passed": bool(args.skip_shape_inference),
+            "passed": None if args.skip_shape_inference else False,
             "error": None,
             "unknown_tensors": None,
             "unknown_dimensions": None,
@@ -219,16 +217,11 @@ def main() -> None:
                 )
                 onnx.checker.check_model(str(inferred_path), full_check=True)
                 inferred = onnx.load(str(inferred_path), load_external_data=False)
-                shape_inference.update({"passed": True, **count_unknown_shapes(inferred)})
+                counts = count_unknown_shapes(inferred)
+                shape_inference.update({"passed": not any(counts.values()), **counts})
             finally:
                 inferred_path.unlink(missing_ok=True)
 
-        requested_providers = args.providers or ["CPUExecutionProvider"]
-        unavailable = sorted(set(requested_providers) - set(ort.get_available_providers()))
-        if unavailable:
-            raise RuntimeError(
-                f"ONNX Runtime provider 不可用：{unavailable}；当前可用：{ort.get_available_providers()}"
-            )
         session = ort.InferenceSession(str(model_path), providers=requested_providers)
         session_input_names = {item.name for item in session.get_inputs()}
         session_output_names = {item.name for item in session.get_outputs()}
@@ -262,13 +255,18 @@ def main() -> None:
         }
         routing_coverage = not routing_required or len(routing_hashes) >= 2
         passed = bool(
-            shape_inference["passed"]
+            (args.skip_shape_inference or shape_inference["passed"])
             and all(vector["passed"] for vector in vector_reports)
             and routing_coverage
         )
+        verify_artifact_identity(model_path, identity)
         report = {
             "passed": passed,
+            "artifact_identity": identity,
+            "validation_level": "diagnostic" if diagnostic else "strict",
             "case": metadata["case"],
+            "profile": metadata.get("profile"),
+            "product_component": metadata.get("product_component"),
             "model": str(model_path),
             "model_sha256": model_hash,
             "checker": "passed",
@@ -290,14 +288,14 @@ def main() -> None:
         }
         write_json(report_path, report)
     except Exception as error:
-        write_failure(report_path, model_path, error, started)
+        write_failure(failure_path, model_path, error, started)
         raise
 
     for vector in report["test_vectors"]:
         for name, stats in vector["comparisons"].items():
             print(
                 f"[{('OK' if stats['allclose'] else 'FAIL')}] vector={vector['index']} {name}: "
-                f"max_abs={stats['max_abs_error']:.6g}, max_rel={stats['max_rel_error']:.6g}"
+                f"max_abs={stats['max_abs_error']}, max_rel={stats['max_rel_error']}"
             )
     print(f"[OK] distinct_routing_patterns={report['routing_coverage']['distinct_patterns']}")
     print(f"[{'OK' if report['passed'] else 'FAIL'}] report={report_path}")

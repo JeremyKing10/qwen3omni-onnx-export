@@ -1,8 +1,8 @@
 # Qwen3-Omni ONNX 导出与编译器验证任务交接说明
 
-## 0. 接管前必读（2026-09-22 最新状态）
+## 0. 接管前必读（2026-09-23 修订）
 
-> 把本文档交给另一台机器上的 AI 时，**请让它先读完第 0 节再看其他章节**。第 1～15 节是历史决策与过程记录，部分步骤标注已过期；第 16 节以后是状态。最新、最准确的操作说明在 `README.md`。
+> 接管时先读第 0 节。第 1～16 节是历史决策和实验记录，包括已过期的编译器任务、命令、哈希、节点数与旧验收结论，不作为本轮实测证据。当前操作以 `README.md`、当前 CLI 和重新生成的 schema v2 报告为准；本轮执行结果集中在 `Qwen3_Omni_ONNX_自检验证报告.md` 第 0.1 节。
 
 ### 0.1 任务定义（已更新）
 
@@ -13,62 +13,57 @@
 
 ### 0.2 当前真实进度
 
-已完成：
+已有实现与历史实验：
 
-1. 固定源码与环境（Transformers v5.2.0 commit `7d9754a0…`、Python 3.11.9、PyTorch 2.8.0、ONNX 1.22.0、ORT 1.30.0）。
-2. 四组件正式导出链路：`vision_encoder`、`audio_encoder`、`thinker_prefill`、`thinker_decode`。
-3. 显式 KV Cache：Prefill 输出 96 个 K/V；Decode 输入/输出 96 个；**past-sequence 动态轴**；三步自回归续接已验证。
-4. 早期三级回归基线：`rmsnorm`(7) / `moe_block`(33) / `tiny_thinker`(142) 节点。
-5. 完整证据链：哈希绑定、严格 Shape 推导、ORT 数值对比、MoE 双路由覆盖、external data 校验、算子汇总（461 节点 / 41 种标准算子 / 0 自定义 domain）。
-6. 两轮代码审查与修复：第一轮 4 个真实缺陷，第二轮 15 项（证据安全、real 路径门禁、dtype 契约、容量守卫等，见第 16 节）。
-7. 交付物：`README.md`、`.gitignore`、`requirements.txt`、`scripts/bootstrap.sh`。
+1. 固定 Transformers v5.2.0 commit `7d9754a0…`；历史环境为 Python 3.11.9、PyTorch 2.8.0、ONNX 1.22.0、ORT 1.30.0。
+2. 四组件接口：`vision_encoder`、`audio_encoder`、`thinker_prefill`、`thinker_decode`。tiny 文本 1 层/2 个 KV，vision 1 层，audio 1 层/16 mel/20 帧；官方 48 层/96 个 KV 尚未真实权重验收，real 默认 audio 为 101 帧。
+3. 历史 tiny 三步 Decode 和两组路由输出有通过记录；旧 461 节点 / 41 种算子不作为本轮结果。Decode 的 64 上界为导出约束，不表示全范围已测。
+4. 本轮公共模块 `onnx_artifact_utils.py` 与持久 `tests/test_*.py` 覆盖证据、路径与数据交换等边界；实际执行结果见自检报告第 0.1 节：59 项 unittest 通过，tiny 全流程退出码 0，重导出为 467 节点 / 41 种算子。
+5. 导出改为“暂存 + 回滚”的事务流程：先在暂存目录导出并通过 Checker，全部成功才整体替换旧产物并失效化旧全局证据；任何异常反向恢复，`--force` 不再会在预检阶段就删除旧 ONNX。
+5. 本轮区分官方顶层语义 → Wrapper 与 Wrapper → ORT 两条参考链，避免共享错误位置逻辑。schema v2 要求绑定 ONNX、external data、metadata 与向量；导出时真实源码 bytes 归档仍待实现与验收，当前源码 hash/environment/git 不等于源码归档。旧产物须重导出验收，不能手改 JSON 升级。
 
-**当前产物性质：tiny 接口验证件**（结构与接口同官方一致，权重为随机小配置）。**不得**称为“Qwen3-Omni-30B 实权重 ONNX”。
+**当前定位仍为 tiny 接口验证件**，不能保证官方规模或全部执行路径，不能以有限数值样例宣称数学等价。`tools/` 是打包时快照，不是不可篡改证据；哈希不是签名。lock 当前为 `torch==2.8.0`，不是 macOS wheel URL；环境还需 bootstrap、固定源码及平台依赖恢复。
 
-### 0.3 唯一阻塞与下一步
+### 0.3 已知阻塞、未知项与下一步
 
-- 阻塞：官方权重 59.08 GiB > 本机 48 GiB 内存；工具用 `--minimum-memory-gib` 门禁强制拦截，不会假成功。
-- 下一步（在 ≥128 GiB Linux 上执行，详见 `README.md` 第 9 节）：
+- 本机 48 GiB 不具备安全加载约 59.08 GiB 权重的条件；不得调低 `--minimum-memory-gib` 到 96 来硬跑，也不要用 offload 绕过保护。
+- 128 GiB 导出 / 192 GiB 端到端只是规划门槛；仍需验证可用内存、峰值驻留、磁盘、checkpoint 完整性、PyTorch 设备、ORT provider 与全部内核。
+- 条件式一键流程：先恢复固定源码和环境、运行 tiny 回归、准备固定 revision 权重和 processor/config、用 `run_real_thinking_pipeline.py --preflight-only` 做只读预检（不加载 59 GiB 权重、不写产品目录），再运行带 `--run-end-to-end` 的 real runner。精确参数见 `README.md` 第 9 节，不能将这里的计划说成已执行。
+- `--device cpu/cuda` 决定 PyTorch 设备，`--provider CPUExecutionProvider/CUDAExecutionProvider` 决定 ORT 后端，必须分别确认。BF16 CPU IOBinding 小图交换成功不代表完整 Qwen 的 BF16 内核已验收。
+- `--component` 单独执行只导出该组件；默认 real runner 不跑端到端，不满足最终官方验收。必须重生成并核验组件报告、两条参考链、端到端、算子汇总与 manifest。
+- 仅支持 Qwen3-Omni Thinking。DeepSeek/Kimi 不能靠换 `--model-path` 自动导出；多模型复用与适配边界见 `README.md` 第 14 节，不重组当前目录。
 
-```bash
-git clone https://github.com/JeremyKing10/qwen3omni-onnx-export.git
-cd qwen3omni-onnx-export && bash scripts/bootstrap.sh && source .venv/bin/activate
-python run_local_thinking_pipeline.py          # 先验环境（无需权重）
-hf download Qwen/Qwen3-Omni-30B-A3B-Thinking \
-  --revision 2f443cfc4c54b14a815c0e2bb9a9d6cbcd9a748b \
-  --local-dir /data/Qwen3-Omni-30B-A3B-Thinking
-python run_real_thinking_pipeline.py \
-  --model-path /data/Qwen3-Omni-30B-A3B-Thinking \
-  --dtype float16 --device cuda --minimum-memory-gib 128
-```
-
-补充索引（新接管的 AI 请一并阅读）：
-
-- **tiny 与官方模型的差距对照表** → `README.md` 第 1.1 节（解释为什么当前产物不能叫“官方权重 ONNX”）
-- **大内存机器上的完整命令速查（含“逐个组件导出 + 收尾命令”）** → `README.md` 第 9.4 节
-  - 注意：`--component` 逐个导出**只做导出**，必须再跑 `validate_onnx.py` / `inspect_onnx.py` / `aggregate_operators.py` / `build_thinking_package.py` 才有完整产品包；只有 `run_real_thinking_pipeline.py` 一条龙才自动串好全部步骤。
-
-验收判据（打开 `manifest.json`）：
+验收判据（必须由工具重验并生成当前 `manifest.json`，不可手工设置）：
 
 ```text
+schema_version                  = 2
+passed                          = true
 status                          = official-weight-components-validated
 official_weights_included       = true
 shared_checkpoint_fingerprint   = true
 source_equivalence_passed       = true
+evidence_sources_match          = true
 end_to_end_validation_passed    = true
+operator_summary_valid          = true
 ```
+
+还须核验各报告的产物绑定与完整输出覆盖；哈希不代替可信生成过程。
 
 ### 0.4 一键自检（任何机器改代码后必跑）
 
 ```bash
+set -e
 source .venv/bin/activate
-python -m py_compile *.py
-python -c "from qwen3_omni_onnx_cases import assert_transformers_provenance as f; print(f())"
+python -B -m unittest discover -s tests -v
 python run_local_thinking_pipeline.py
-for c in rmsnorm moe_block tiny_thinker; do python validate_onnx.py --case $c --model artifacts/$c/model.onnx; done
+for c in rmsnorm moe_block tiny_thinker; do
+  python export_onnx.py --case "$c" --output-dir "artifacts/$c" --force
+  python validate_onnx.py --case "$c" --model "artifacts/$c/model.onnx"
+  python inspect_onnx.py --model "artifacts/$c/model.onnx" --fail-on-custom-domain
+done
 ```
 
-全部 `[OK]` 才算通过；反向测试（改 1 字节 ONNX / `--atol inf` / `--force` 越界）应分别被哈希链、容差校验、路径防护拦截。
+这是验收命令参考，不是本轮执行记录。先保留需要的旧产物，且不要覆盖 real 目录；旧 schema 产物必须重导出。以实际退出码、结构化报告和测试输出验收，不凭筛选出的 `[OK]` 行判断。反向场景由隔离目录中的持久 unittest 覆盖，不修改正式产物来手造通过。
 
 ### 0.5 禁止事项
 
@@ -1225,9 +1220,11 @@ external data 文件及大小
 
 ---
 
-## 16. 当前状态与注意事项
+## 16. 历史状态与注意事项（截至 2026-09-22）
 
-### 当前已完成
+> 本节保留旧实验与修复记录，不声明本轮通过。下方旧 hash、461/41 和旧 e2e 不对应 schema v2；当前边界与操作看第 0 节和 `README.md`。
+
+### 历史已完成
 
 - 已确认“onmix”实际指 ONNX。
 - 已明确总体任务流程和“标准 ONNX 主线 + NVIDIA 参考线”的双路线。
@@ -1245,10 +1242,9 @@ external data 文件及大小
 - 已确认首轮真实模型包装边界为 Thinker Text Model + Thinker LM Head。
 - 已确认 NVIDIA 参考产物普遍包含 TensorRT 自定义域，主要用作拆分和改写参考。
 
-### 当前尚未完成
+### 尚未完成（本轮仍适用）
 
-- **官方 30B 权重的四组件 ONNX 尚未导出**：唯一阻塞是本机 48 GiB 内存 < 59.08 GiB 权重，需迁移到 ≥128 GiB Linux 机器（README 第 9 节）。
-- 尚未在官方权重上跑端到端三步 Decode（同样受内存限制）。
+- **官方 30B 四组件与 real 三步 Decode 尚未验收**：本机 48 GiB 内存不足是已知阻塞，但不是唯一未知项；迁移大内存 Linux 仍需实际验证内核、dtype、峰值资源和官方语义，见 `README.md` 第 9 节。
 - 未提供“单个 ONNX 文件”形态（当前产品是四组件 + 宿主调度；如有硬性单文件需求需新增导出模式）。
 - 语音输出组件（Talker / CodePredictor / Code2Wav）未实现（Thinking checkpoint 本身无语音链路）。
 - 未运行 Optimum 支持性快速测试；该测试不是主线阻塞项。
@@ -1256,13 +1252,13 @@ external data 文件及大小
 
 ### 2026-09-22 追加完成
 
-- 四组件正式导出链路已完成并通过验证：`vision_encoder`、`audio_encoder`、`thinker_prefill`、`thinker_decode`。
-- 显式 KV Cache 已完成：Prefill 输出 96 个 K/V，Decode 输入输出 96 个，并支持**动态 past-sequence** 与三步自回归续接。
-- 早期三级回归（rmsnorm / moe_block / tiny_thinker）已并入回归基线。
-- 产品包与证据链已完成：`manifest.json`、`validation/end_to_end.json`、`operators/summary.json + all_operators.csv`、`test_data/`、`tools/` 快照。
-- 全量回归 + 代码审查已完成，修复 4 个真实缺陷：real 导出前误删旧证据、real fp16 端到端 dtype 不匹配、tiny 覆盖 real 端到端报告、`--source-dir` config 未做 checkpoint 指纹校验。
-- GitHub 仓库已建立：`https://github.com/JeremyKing10/qwen3omni-onnx-export.git`（main 分支，已提交），并新增 `README.md`、`.gitignore`、`requirements.txt`、`scripts/bootstrap.sh`。
-- 当前实测：四组件合计 461 节点、41 种标准算子、0 个自定义 domain。
+- 历史日志记录四组件 tiny 导出和 Wrapper → ORT 通过；不等于本轮已完成独立官方顶层参考验收。
+- 历史 tiny Prefill/Decode 每步实际为 2 个 K/V，支持动态 past-sequence 与三步续接；此前将官方配置的 96 个误写成实测数，现更正。
+- 早期三级回归（rmsnorm / moe_block / tiny_thinker）并入回归基线。
+- 旧产品含 manifest、端到端报告、算子汇总、向量和 `tools/` 快照；不符合本轮 schema v2 的产物需要重导出，不能只更新证据字段。
+- 当时记录修复了 real 导出前证据删除、fp16 接力 dtype、tiny 覆盖 real 报告、source-dir config 指纹等问题；不据此宣称已发现并修好全部缺陷。
+- 历史仓库创建与提交记录保留：`https://github.com/JeremyKing10/qwen3omni-onnx-export.git`，本轮不自动提交。
+- 历史统计保留：461 节点、41 种标准算子、0 自定义 domain；不是当前代码重导出的结果。
 
 ### 2026-09-22 第二轮修复（全量代码审查 + 全 md 命令核对）
 
@@ -1281,25 +1277,24 @@ external data 文件及大小
 **代码（real 路径，本机装不下 59 GiB，仅静态审查）**
 
 - 显存门禁：索引缺 `total_size` 时改为按磁盘分片实际大小估算（此前算出 0 → **静默跳过门禁**）；不再强依赖 `model.safetensors.index.json`；校验 `--device cuda:N` 设备号。
-- `--minimum-memory-gib` 默认 96 → 128；real 的 `--device` 默认是 `cpu`（文档此前误写为默认 cuda）。
-- `validate_thinking_pipeline.py`：`bfloat16` 不再映射成 float32；`--model-path` 支持 `~`；`package_dir` 加工作区/符号链接防护；real 分支增加 CUDA 门禁；CPU EP 遇到 bf16 图直接给出可操作报错（实测：CPU EP 下喂 float32 与喂 `ml_dtypes.bfloat16` 都会被 ORT 拒绝）。
-- `build_thinking_package.py` / `run_real_thinking_pipeline.py`：real 未通过 §9.3 验收判据时以**非 0**退出，不再打印 `[OK]` 误报成功。
+- 历史调整 `--minimum-memory-gib` 默认保护线；设备默认值以各 CLI 当前代码为准，迁移命令显式指定 PyTorch `--device` 和 ORT `--provider`，二者不能混用。
+- 历史普通 NumPy 喂 BF16 失败只说明当时数据交换路径有问题，不能推导 CPU 不支持全部 BF16。当前 CPU IOBinding Cast/Identity 与 NPZ 位保持测试成功；完整 Qwen 图仍依赖实际内核/环境，不保证改 CUDA 即可。
+- 当时增加 real 验收不满足时非零退出；最终以 schema v2 的实际绑定与报告覆盖为准。
 
-**文档**
+**文档（历史修订记录）**
 
-- 三份 md 里的命令逐条实跑核对；修正：`--case` 使用说明、RMSNorm 打印图的真实输出、失效的 `docs/` 引用、Step 6 三条导出命令缺 `--force`、节点数 462→461 与两个组件哈希、`tools/` 随包快照补 `requirements.txt`、GitHub 地址占位符、bf16/CPU 与 `--device` 默认值说明。
+- 曾修正 case 说明、图打印示例、失效链接、force 参数与旧节点/hash 记录。不能声称全部文档命令已实跑；本机不能执行官方 30B，本文的迁移命令仅作参考。
 
 ### 特别注意
 
-- 暂时不要直接执行模型仓库的 Git LFS 克隆，以免意外下载几十 GB 级别的权重。
-- 不要把 `generate()` 当作首轮 ONNX 导出接口。
-- 不要因为导出器生成了文件就认为 MoE 图一定正确。
-- 不要先花大量时间手工整理算子，最终算子清单应从 ONNX 图自动提取。
-- 导出器、Transformers 和模型代码仍可能变化，正式实施时必须记录版本和 commit。
-- **用 ONNX Runtime 的 CPU 后端做验证时，导出精度必须选 `float16`**：bf16 图在 `CPUExecutionProvider` 上无法喂数（工具会直接报错，不会假通过）；只有 CUDA EP 才可能支持。
+- 不要意外下载几十 GiB 权重或在本机绕过内存保护。
+- 不导出 `generate()`；生成 ONNX 文件不代表语义、路由或内核验收通过。
+- 算子清单以当前 ONNX 实际统计为准；旧数字不能当本轮结果。
+- 当前公共产物模块和持久 unittest 均在根目录结构下维护；不重组目录。
+- 验证逐组件实际 dtype：Vision 索引 `int32`，Text 位置 mask `bool`，Audio `cu_seqlens int32`，real 浮点张量并非全部 `float32`。
 
 ---
 
 ## 17. 一句话交接结论
 
-三套源码、Python 3.11 环境和四组件 ONNX 导出链路现已全部完成并通过验证（含动态 KV Cache 与三步 Decode）。当前唯一阻塞是官方权重 59.08 GiB 超过本机 48 GiB 内存；迁移到 ≥128 GiB Linux 后按 `README.md` 第 9 节执行 `run_real_thinking_pipeline.py` 即可产出官方权重产品，并以 `manifest.json` 的 `official-weight-components-validated` 作为最终验收。完整操作说明以 `README.md` 为准，本文档第 0 节为接管速览。
+已有 Qwen3-Omni Thinking 四组件工具和 tiny 历史验证；本轮修复必须通过持久 unittest、重新导出与 schema v2 双参考链验收，结果看自检报告第 0.1 节。官方 30B 在本机始终未验收，大内存仅满足部分前提；按 `README.md` 第 9 节预检并执行条件式流程，不承诺无需改代码或一键必成。只有实际报告及其当前产物绑定全部满足，才允许产生 `official-weight-components-validated`。

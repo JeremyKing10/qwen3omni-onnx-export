@@ -7,7 +7,8 @@ from typing import Any, Iterable
 
 import onnx
 
-from qwen3_omni_onnx_cases import file_sha256, write_json
+from qwen3_omni_onnx_cases import WORKSPACE, file_sha256, write_json
+from onnx_artifact_utils import artifact_identity, external_data_files, iter_messages, safe_path
 
 STANDARD_DOMAINS = {"", "ai.onnx", "ai.onnx.ml"}
 
@@ -54,79 +55,33 @@ def iter_graph_nodes(graph: onnx.GraphProto) -> Iterable[onnx.NodeProto]:
 
 
 def safe_external_path(model_dir: Path, location: str) -> Path:
-    if not location:
-        raise ValueError("external data 缺少 location")
-    candidate = (model_dir / location).resolve()
-    try:
-        candidate.relative_to(model_dir.resolve())
-    except ValueError as error:
-        raise ValueError(f"external data 路径越出模型目录：{location}") from error
-    return candidate
-
-
-def external_data_files(model: onnx.ModelProto, model_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
-    files: dict[str, dict[str, Any]] = {}
-    errors: list[str] = []
-    for initializer in model.graph.initializer:
-        if initializer.data_location != onnx.TensorProto.EXTERNAL and not initializer.external_data:
-            continue
-        external = {item.key: item.value for item in initializer.external_data}
-        location = external.get("location", "")
-        try:
-            file_path = safe_external_path(model_path.parent, location)
-        except ValueError as error:
-            errors.append(f"{initializer.name}: {error}")
-            continue
-        exists = file_path.is_file()
-        size = file_path.stat().st_size if exists else None
-        offset = int(external.get("offset", "0"))
-        length_text = external.get("length")
-        length = int(length_text) if length_text is not None else None
-        range_valid = bool(
-            exists
-            and size is not None
-            and size > 0
-            and offset >= 0
-            and (length is None or (length >= 0 and offset + length <= size))
-        )
-        if not range_valid:
-            errors.append(f"{initializer.name}: external data 文件缺失、为空或 offset/length 越界")
-        entry = files.setdefault(
-            location,
-            {
-                "location": location,
-                "resolved_path": str(file_path),
-                "exists": exists,
-                "bytes": size,
-                "sha256": file_sha256(file_path) if exists and size else None,
-                "all_ranges_valid": True,
-                "initializers": [],
-            },
-        )
-        entry["all_ranges_valid"] = entry["all_ranges_valid"] and range_valid
-        entry["initializers"].append(
-            {"name": initializer.name, "offset": offset, "length": length, "range_valid": range_valid}
-        )
-    return sorted(files.values(), key=lambda item: item["location"]), errors
+    candidate = Path(location)
+    if not location or candidate.is_absolute():
+        raise ValueError("external data location 必须是相对路径")
+    return safe_path(model_dir, model_dir / candidate, must_exist=True)
 
 
 def main() -> None:
     args = parse_args()
-    model_path = args.model.expanduser().resolve()
-    output_path = (args.output or model_path.parent / "operators.json").expanduser().resolve()
-    if not model_path.is_file():
-        raise FileNotFoundError(model_path)
-    if output_path == model_path:
-        raise ValueError("JSON 报告不能覆盖 ONNX 模型")
+    model_path = safe_path(WORKSPACE, args.model, must_exist=True)
+    output_path = safe_path(WORKSPACE, args.output or model_path.parent / "operators.json")
+    if output_path.suffix != ".json" or output_path.name in {"export_metadata.json", "validation.json", "manifest.json"}:
+        raise ValueError("算子报告必须使用独立 JSON 文件，不能覆盖模型、元数据或验证报告")
 
     model = onnx.load(str(model_path), load_external_data=False)
     external_files, external_errors = external_data_files(model, model_path)
     external_paths = {Path(item["resolved_path"]) for item in external_files}
+    for tensor in iter_messages(model, onnx.TensorProto):
+        for entry in tensor.external_data:
+            if entry.key == "location" and entry.value:
+                location = Path(entry.value)
+                if not location.is_absolute() and ".." not in location.parts:
+                    external_paths.add(safe_path(model_path.parent, model_path.parent / location))
     if output_path in external_paths:
-        raise ValueError("JSON 报告不能覆盖 ONNX external data 文件")
+        raise ValueError("JSON 报告不能覆盖 ONNX external data 文件，即使该权重文件目前缺失")
 
     nodes = list(iter_graph_nodes(model.graph))
-    function_nodes = [node for function in model.functions for node in function.node]
+    function_nodes = [node for function in model.functions for node in iter_messages(function, onnx.NodeProto)]
     all_nodes = [*nodes, *function_nodes]
     operator_counts = collections.Counter(((node.domain or "ai.onnx"), node.op_type) for node in all_nodes)
     domain_counts = collections.Counter((node.domain or "ai.onnx") for node in all_nodes)
@@ -140,11 +95,14 @@ def main() -> None:
     initializer_names = {initializer.name for initializer in model.graph.initializer}
     graph_inputs = [item for item in model.graph.input if item.name not in initializer_names]
     external_valid = not external_errors and all(
-        item["exists"] and item["bytes"] and item["all_ranges_valid"]
-        for item in external_files
+        item["exists"] and item["all_ranges_valid"] for item in external_files
     )
+    identity = None
+    if external_valid and (model_path.parent / "export_metadata.json").is_file():
+        identity = artifact_identity(model_path, scanned_external=external_files)
     report = {
         "passed": bool(external_valid and (not args.fail_on_custom_domain or not custom_domains)),
+        "artifact_identity": identity,
         "model": str(model_path),
         "model_bytes": model_path.stat().st_size,
         "model_sha256": file_sha256(model_path),
@@ -166,7 +124,7 @@ def main() -> None:
         "domain_counts": dict(sorted(domain_counts.items())),
         "custom_domains": custom_domains,
         "external_data": {
-            "used": bool(external_files),
+            "used": any(t.data_location == onnx.TensorProto.EXTERNAL or t.external_data for t in iter_messages(model, onnx.TensorProto)),
             "files": external_files,
             "errors": external_errors,
             "all_files_present_and_valid": external_valid,

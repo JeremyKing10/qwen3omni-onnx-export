@@ -95,6 +95,12 @@ def assert_transformers_provenance() -> dict[str, str]:
         raise RuntimeError(
             f"Transformers revision 不匹配：{revision}；期望 {EXPECTED_TRANSFORMERS_REVISION}"
         )
+    status = subprocess.run(
+        ["git", "-C", str(TRANSFORMERS_REPO), "status", "--porcelain", "--untracked-files=all", "--", "src/transformers"],
+        check=True, capture_output=True, text=True,
+    )
+    if status.stdout.strip():
+        raise RuntimeError("固定 Transformers 模型源码存在未提交修改或新增源码；拒绝冒用固定 commit 的来源证明")
     return {"imported_file": str(imported_file), "revision": revision}
 
 
@@ -281,7 +287,7 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
             handle.write("\n")
         temporary_path.replace(path)
     except Exception:

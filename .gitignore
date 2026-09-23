@@ -25,3 +25,6 @@ model.onnx.data
 # 系统与日志
 .DS_Store
 *.log
+
+# 导出事务锁（并发互斥，不是产物）
+*.export.lock

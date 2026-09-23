@@ -610,6 +610,7 @@ tiny_thinker → 验证 Attention+RoPE+Mask+MoE+LM Head 组合
 - `Qwen3-Omni_ONNX_任务交接说明.md`：任务背景、路线决策（标准 ONNX 主线 + NVIDIA 参考线）、接管指南与最新状态（交给另一台机器的 AI 时先读它的第 0 节）
 - `artifacts/real_thinking_metadata/resource_assessment.json`：官方权重规模与本机资源评估证据
 - `Qwen3_Omni_ONNX_导出工具说明.md`：历史设计说明，内容已并入本 README（保留文件仅为兼容旧链接）
+- `Qwen3_Omni_ONNX_突破看似完备的经验总结.md`：**防幻觉与自我反思方法**——如何在一个“看似完备”的版本上继续发现新问题（六类幻觉、七种发掘方法、十项检查单、交接给其他 AI 时的输出契约）。**每次修改代码前后都应参照它执行，并可随时追加新教训。**
 
 ## 14. 能否扩展到 DeepSeek、Kimi 等多模型？
 

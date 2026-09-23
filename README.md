@@ -153,7 +153,7 @@ python export_thinking_onnx.py --mode tiny --component thinker_decode  --package
 - `onnx/thinker_decode/model.onnx` ← 第四条（`--component thinker_decode`）
 
 > 四个组件也可以一条命令全出：`--component all`（见 5.1）。
-> 想一步到位连导出+验证+端到端+算子汇总+打包全跑完，用 `python run_local_thinking_pipeline.py`（第 4 节）。
+> 想一步到位连导出+验证+端到端+算子汇总+打包全跑完，用 `python run_local_thinking_pipeline.py --offline`（第 4 节）。
 
 ### 5.1 四组件导出
 
@@ -166,6 +166,23 @@ python export_thinking_onnx.py --mode real --component all --model-path /path/to
 ```
 
 `--component` 可选 `vision_encoder | audio_encoder | thinker_prefill | thinker_decode | all`。
+
+**real 模式注意**：`--device cuda/cpu` 决定 PyTorch 设备，`--provider` 属于 ONNX Runtime、由验证阶段使用，两者独立；上面 real 示例的 `--minimum-memory-gib 128` 是**导出**门槛，启用端到端验证需 192（见第 9 节）。
+
+### 5.1.1 导出事务、回滚与并发
+
+导出不再“边检查边删除”，而是：
+
+1. 纯只读预检：目标目录、祖先路径、符号链接、权限与 `--force` 授权；
+2. 在暂存目录导出全部组件并通过 ONNX Checker；
+3. 全部成功后，把旧组件与旧全局证据移入备份，再整体安装新产物；
+4. 任何异常反向恢复旧组件与旧证据；回滚本身失败时保留备份目录并报错，不静默清理。
+
+并发与残留：
+
+- 同一产品目录的导出用 `.export.lock` 互斥；另一个进程正在导出时会直接报错而不是等待。
+- 若发现 `.transaction-*` 残留目录，说明上一次事务未正常结束：工具**不会自动删除**未知目录，请先检查备份内容再手工处理。
+- 正常异常可回滚；SIGKILL、断电等不保证完整性，这也是失败时保留备份的原因。
 
 ### 5.2 单模型严格验证
 
@@ -189,6 +206,17 @@ python validate_onnx.py --model Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/thinker_de
 python validate_onnx.py --case moe_block --model artifacts/moe_block/model.onnx
 ```
 
+**报告文件与严格性**（避免“为什么 validation.json 没更新”的困惑）：
+
+| 运行方式 | 写入文件 | 是否可作为正式验收证据 |
+|---|---|---|
+| 默认（`rtol≤1e-4`、`atol≤1e-5`、完成 Shape Inference） | `validation.json` | ✅ 严格通过 |
+| `--skip-shape-inference`，或容差宽于上述基线 | `validation.diagnostic.json` | ❌ 仅诊断，打包会拒绝 |
+| 校验过程异常（provider 不可用、输入不合法等） | `validation.failure.json` | ❌ 失败记录 |
+
+- 参数错误（`--case` 传错、provider 不存在、`--atol inf`）会在**写任何报告之前**失败，原有 `validation.json` 保持原样。
+- 只有身份（模型、external、metadata、向量）与判据都通过的 `validation.json` 才会被打包采信；诊断报告不能顶替。
+
 ### 5.3 算子 / 结构检查
 
 ```bash
@@ -201,7 +229,11 @@ python inspect_onnx.py --model Qwen3-Omni-30B-A3B-Thinking-ONNX/onnx/thinker_dec
 python validate_thinking_pipeline.py --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX
 ```
 
-real 模式须显式提供 `--mode real --model-path ... --device cpu/cuda --provider ...` 及相应资源设置；精确流程见第 9 节。`--force` 不是证据升级手段。不要用 tiny 重建命令覆盖已有 real 产品；先保留所需产物并选用独立输出目录，失败报告与模式保护以当前 CLI 为准。
+real 模式须显式提供 `--mode real --model-path ... --device cpu/cuda --provider ...` 及相应资源设置；端到端验证还需 `--minimum-memory-gib ≥192`，精确流程见第 9 节。
+
+- `--force` 只表示“允许覆盖模式不同的旧端到端报告”，**不是证据升级手段**；新成功后以更新时间戳覆盖旧失败语义，不会删旧文件。
+- 执行失败写 `validation/end_to_end.failure.json`，旧报告保留；若失败时间戳不早于旧成功报告，旧成功不再被采信。
+- 不要用 tiny 重建命令覆盖已有 real 产品；先保留所需产物并选用独立输出目录。
 
 ### 5.5 算子汇总与打包
 
@@ -209,6 +241,8 @@ real 模式须显式提供 `--mode real --model-path ... --device cpu/cuda --pro
 python aggregate_operators.py --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX
 python build_thinking_package.py --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX --offline
 ```
+
+`--source-dir <checkpoint 根目录>` 用于从本地 checkpoint 取 `config.json`、`generation_config.json` 与 processor/tokenizer 文件；显式指定时必须本地**整套齐全**，缺一即失败，不会与 HF 混用。`--offline` 表示只使用本地文件或已有缓存；允许联网时可省略这两个参数的离线限制。
 
 ### 5.6 早期三级 tiny 回归（RMSNorm / MoE Block / Tiny Thinker）
 
@@ -520,6 +554,9 @@ git checkout <commit> -- <file>   # 恢复单个文件
 - **换 Shape**：修改 profile 后重导出并重新验收，不复用旧 schema 或旧报告；换模型还需专门适配，见第 14 节。
 - **BF16 喂数或 kernel 错误**：区分数据交换失败与算子内核缺失；当前有位保持 NPZ/IOBinding 路径，不将 BF16 偷换 FP32。CPU 小图交换成功不代表 Qwen 整图通过，换 CUDA 或 FP16 也须重新验收。
 - **打包 `unverified-real-artifacts` 或非零退出**：检查是否缺 real 端到端、参考链、当前 schema v2 绑定或必要配置。`--run-end-to-end` 是必要流程选项，不是保证成功的开关。
+- **`validation.json` 没有更新**：你可能用了 `--skip-shape-inference` 或更宽的容差，此时结果写入 `validation.diagnostic.json`；异常写入 `validation.failure.json`。只有严格通过才更新 `validation.json`。
+- **出现 `.export.lock` 或 `.transaction-*`**：前者是并发互斥锁，正常结束不会遗留；后者是未正常结束的事务备份，工具不会自动删除，请先检查备份内容再手工处理。
+- **另一个导出进程正在使用目标目录**：同一产品目录不允许并发导出，请等待或改用独立目录。
 
 ## 12. 设计决策与实现选择
 

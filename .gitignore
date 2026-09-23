@@ -28,3 +28,6 @@ model.onnx.data
 
 # 导出事务锁（并发互斥，不是产物）
 *.export.lock
+
+# 本地协作/工具记录（不入库）
+.codebuddy/

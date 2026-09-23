@@ -267,13 +267,25 @@ schema v2 报告绑定当前 ONNX、external data、metadata 与向量
 set -e
 source .venv/bin/activate
 python -B -m unittest discover -s tests -v
-python run_local_thinking_pipeline.py
+python run_local_thinking_pipeline.py --offline
 for c in rmsnorm moe_block tiny_thinker; do
   python export_onnx.py --case "$c" --output-dir "artifacts/$c" --force
   python validate_onnx.py --case "$c" --model "artifacts/$c/model.onnx"
   python inspect_onnx.py --model "artifacts/$c/model.onnx" --fail-on-custom-domain
 done
 ```
+
+官方权重阶段先做只读预检（不加载 59 GiB 权重、不写产品目录）：
+
+```bash
+python run_real_thinking_pipeline.py \
+  --model-path /data/Qwen3-Omni-30B-A3B-Thinking \
+  --package-dir Qwen3-Omni-30B-A3B-Thinking-ONNX-real \
+  --device cpu --provider CPUExecutionProvider \
+  --minimum-memory-gib 192 --run-end-to-end --preflight-only
+```
+
+命令约定：`--offline` 只影响 7 个非权重资源的获取方式；`--device` 是 PyTorch 设备、`--provider` 是 ONNX Runtime 后端，需分别确认；导出失败会写 `validation.failure.json` / `end_to_end.failure.json` 并保留旧报告，宽容差结果只写入 `validation.diagnostic.json`。
 
 反向场景使用 `tests/test_*.py` 的持久 unittest，在临时隔离目录验证，不需要照抄历史 `rm -rf/dd` 操作。`--case` 调用错误应保留有效旧报告；产物身份或绑定失效应阻止旧报告继续被采信。具体覆盖以本轮真实 unittest 输出为准。
 

@@ -55,7 +55,7 @@ operator_summary_valid          = true
 set -e
 source .venv/bin/activate
 python -B -m unittest discover -s tests -v
-python run_local_thinking_pipeline.py
+python run_local_thinking_pipeline.py --offline
 for c in rmsnorm moe_block tiny_thinker; do
   python export_onnx.py --case "$c" --output-dir "artifacts/$c" --force
   python validate_onnx.py --case "$c" --model "artifacts/$c/model.onnx"
@@ -1138,6 +1138,7 @@ inspect_onnx.py            # 输入输出、op_type、domain、节点数量、ex
 
 ```bash
 source /Users/bojunjin/Documents/LLM/qwen3-omni-onnx-work/.venv/bin/activate
+# 改代码后先跑持久回归：python -B -m unittest discover -s tests -v
 # 导出目录非空时必须带 --force，否则工具拒绝覆盖（防误删）
 python export_onnx.py --case rmsnorm --output-dir artifacts/rmsnorm --force
 python validate_onnx.py --case rmsnorm --model artifacts/rmsnorm/model.onnx

@@ -9,8 +9,8 @@ import sys
 from pathlib import Path
 
 from build_thinking_package import resolve_package_sources
-from onnx_artifact_utils import check_providers, safe_path
-from qwen3_omni_thinking_components import THINKING_COMPONENTS
+from onnx_artifact_utils import check_execution_resources, safe_path
+from qwen3_omni_thinking_components import THINKING_COMPONENTS, inspect_checkpoint
 
 WORKSPACE = Path(__file__).resolve().parent
 DEFAULT_PACKAGE = WORKSPACE / "Qwen3-Omni-30B-A3B-Thinking-ONNX"
@@ -49,30 +49,20 @@ def operator_report_name(component: str) -> str:
     return component.replace("_encoder", "") + ".json"
 
 
-def preflight(args: argparse.Namespace) -> None:
-    if not (isinstance(args.minimum_memory_gib, float) and math.isfinite(args.minimum_memory_gib)
-            and args.minimum_memory_gib > 0):
-        raise ValueError(f"--minimum-memory-gib 必须为有限正数，实际为 {args.minimum_memory_gib}")
+def preflight(args: argparse.Namespace) -> Path:
+    package_dir = safe_path(WORKSPACE, args.package_dir)
     checkpoint = Path(args.model_path).expanduser().resolve()
-    if not checkpoint.is_dir():
-        raise FileNotFoundError(f"官方 checkpoint 目录不存在：{checkpoint}")
-    for name in ("config.json", "model.safetensors.index.json"):
-        if not (checkpoint / name).is_file():
-            raise FileNotFoundError(f"官方 checkpoint 缺少 {name}：{checkpoint}")
-    check_providers([args.provider])
-    if args.provider == "CUDAExecutionProvider" and not args.device.startswith("cuda"):
-        print("[WARN] provider 使用 CUDA，但 PyTorch device 不是 cuda；两端是独立设置", file=sys.stderr)
-    if args.run_end_to_end and args.minimum_memory_gib < 192.0:
-        raise ValueError("启用 --run-end-to-end 时 --minimum-memory-gib 至少 192（当前为 "
-                         f"{args.minimum_memory_gib}），否则会在导出完成后才发现无法验收")
-    # 端到端验证会在同一进程内同时驻留 PyTorch 模型与 ORT 会话，需要额外的内存/显存余量。
-    required_gib = args.minimum_memory_gib * (1.6 if args.run_end_to_end else 1.0)
-    total, _, free = shutil.disk_usage(checkpoint)
-    print(f"[OK] checkpoint={checkpoint}")
-    print(f"[OK] disk_free={free / 1024**3:.1f} GiB / total={total / 1024**3:.1f} GiB")
-    print(f"[OK] planned_memory_need>= {required_gib:.0f} GiB（含端到端时的 PyTorch+ORT 双份驻留估算）")
-    resolve_package_sources(source_dir=args.source_dir, offline=args.offline)
-    print("[OK] 非权重配置/Processor 资源可用")
+    inspected = inspect_checkpoint(checkpoint)
+    resources = check_execution_resources(inspected, package_dir, args.minimum_memory_gib,
+                                          args.device, args.provider, end_to_end=args.run_end_to_end)
+    source = (args.source_dir or checkpoint).expanduser().resolve()
+    sources = resolve_package_sources(source_dir=source, offline=args.offline)
+    if sources["config.json"].read_bytes() != (checkpoint / "config.json").read_bytes():
+        raise ValueError("--source-dir 的 config.json 与权重 checkpoint 不一致")
+    print(f"[OK] checkpoint headers/tensor mapping: {inspected['tensor_count']} tensors")
+    print("[OK] resource preflight:", json.dumps(resources, ensure_ascii=False))
+    print(f"[OK] non-weight source: {source}")
+    return source
 
 
 def main() -> None:
@@ -82,7 +72,7 @@ def main() -> None:
         preflight(args)
         print("\n[OK] preflight-only 完成：未加载官方权重，未写入产品目录")
         return
-    preflight(args)
+    source = preflight(args)
     common = (
         "--mode", "real", "--model-path", str(Path(args.model_path).expanduser().resolve()),
         "--dtype", args.dtype, "--device", args.device,
@@ -101,7 +91,7 @@ def main() -> None:
         )
     run("aggregate_operators.py", "--package-dir", str(package))
     build_arguments = ["build_thinking_package.py", "--package-dir", str(package),
-                       "--source-dir", str(Path(args.model_path).expanduser().resolve())]
+                       "--source-dir", str(source)]
     if args.offline:
         build_arguments.append("--offline")
     command = [sys.executable, *build_arguments]

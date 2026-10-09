@@ -14,8 +14,11 @@ import torch
 
 from onnx_artifact_utils import (
     artifact_identity,
+    check_execution_resources,
     check_providers,
     require_strict_validation,
+    require_latest_validation,
+    runtime_identity,
     run_ort_session,
     safe_path,
     validate_tolerances,
@@ -24,6 +27,9 @@ from onnx_artifact_utils import (
 from qwen3_omni_onnx_cases import DEFAULT_SEED, WORKSPACE, tensor_to_numpy, write_json
 from qwen3_omni_thinking_components import (
     THINKING_COMPONENTS,
+    AUDIO_ATTENTION_CONTRACT,
+    official_audio_block_attention,
+    inspect_checkpoint,
     Qwen3OmniMoeThinkerForConditionalGeneration,
     build_real_thinking_component,
     build_tiny_thinking_component,
@@ -42,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=Path, help="real 模式官方 checkpoint 目录")
     parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--minimum-memory-gib", type=float, default=128.0)
+    parser.add_argument("--minimum-memory-gib", type=float, default=192.0)
     parser.add_argument("--provider", default="CPUExecutionProvider")
     parser.add_argument(
         "--package-dir",
@@ -157,6 +163,7 @@ def load_component_evidence(package_dir: Path, mode: str, seed: int) -> tuple[di
         identity = artifact_identity(model_path)
         validation = json.loads(validation_path.read_text(encoding="utf-8"))
         require_strict_validation(validation, identity)
+        require_latest_validation(model_path, validation, identity)
         identities[name], metadata[name] = identity, meta
     return identities, metadata
 
@@ -189,7 +196,7 @@ def official_raw_prefill(cases: dict[str, Any], full_model: Any = None) -> tuple
 
     hooks = [thinker.visual.register_forward_hook(capture_vision), thinker.audio_tower.register_forward_hook(capture_audio)]
     try:
-        with torch.inference_mode():
+        with torch.inference_mode(), official_audio_block_attention(thinker.audio_tower):
             output = thinker(
                 input_ids=template[0],
                 attention_mask=template[1],
@@ -218,17 +225,9 @@ def validate_pipeline(args: argparse.Namespace, package_dir: Path, metadata: dic
         if args.model_path is None:
             raise ValueError("real 模式必须提供 --model-path")
         checkpoint_path = args.model_path.expanduser().resolve()
-        memory = psutil.virtual_memory()
-        total_memory_gib = memory.total / 1024**3
-        available_memory_gib = memory.available / 1024**3
-        if total_memory_gib < args.minimum_memory_gib or available_memory_gib < args.minimum_memory_gib * 0.75:
-            raise RuntimeError(
-                f"real 模式需要至少 {args.minimum_memory_gib:.0f} GiB 总内存且至少 "
-                f"{args.minimum_memory_gib * 0.75:.0f} GiB 可用；当前总计 {total_memory_gib:.1f} GiB、"
-                f"可用 {available_memory_gib:.1f} GiB"
-            )
-        if args.device.startswith("cuda") and not torch.cuda.is_available():
-            raise RuntimeError("请求 CUDA 端到端验证，但 torch.cuda 不可用")
+        check_execution_resources(inspect_checkpoint(checkpoint_path), package_dir, args.minimum_memory_gib,
+                                  args.device, args.provider, end_to_end=True, export_stage=False,
+                                  sequence_length=metadata["thinker_prefill"]["interface"]["sequence_profile"])
         dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
         full_model = load_real_thinking_model(str(checkpoint_path), dtype=dtype, device=args.device)
     cases = {
@@ -357,6 +356,9 @@ def main() -> None:
             "comparisons": comparisons,
             "reference_scope": "official_top_level_with_raw_synthetic_features",
             "reference_positions": "official_forward_independent_mrope_and_cache",
+            "runtime_identity": runtime_identity(),
+            "audio_attention_contract": AUDIO_ATTENTION_CONTRACT,
+            "reference_audio_adapter": "upstream_slice_mask; differs from pinned unmasked eager",
             "experts_reference": "official_batched_mm; real eager low-precision equivalence not established",
             "note": "Synthetic raw image/audio tensors with official injection and independent reference caches; not a perceptual media quality benchmark.",
         }

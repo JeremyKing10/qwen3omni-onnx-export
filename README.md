@@ -12,7 +12,7 @@
 
 | 能力 | 状态与边界 |
 |---|---|
-| 四组件接口（Vision / Audio / Thinker Prefill / Thinker Decode） | 已实现；tiny 随机权重历史流程已运行，本轮须重导出生成 schema v2 证据 |
+| 四组件接口（Vision / Audio / Thinker Prefill / Thinker Decode） | 2026-10-08 tiny 重导出与独立参考验收通过；479 节点、43 类算子；官方权重仍未验收 |
 | 显式 KV Cache | tiny 文本 1 层，Prefill 输出 2 个 K/V；官方 48 层对应 96 个，尚未真实权重验收 |
 | Decode 动态 past-sequence 与三步续接 | 有限 tiny profile 回归；64 是导出约束上界，不是全范围实测承诺 |
 | MoE 动态路由 | 采用标准张量路径并检查多组路由，不代表所有专家组合均已覆盖 |
@@ -67,8 +67,6 @@
 ├── build_thinking_package.py        # CLI：整理最终产品目录 + manifest
 ├── run_local_thinking_pipeline.py   # CLI：一键本地全流程（tiny）
 ├── run_real_thinking_pipeline.py    # CLI：一键官方权重全流程（Linux 大内存）
-├── onnx_artifact_utils.py           # 库：安全路径、完整产物指纹、BF16 数据通路与严格判据（与模型无关）
-├── tests/                           # 持久 unittest：公共证据 / 语义 / 端到端 / 打包验收
 ├── artifacts/                       # 早期 tiny ONNX + 官方模型元数据（gitignore）
 └── Qwen3-Omni-30B-A3B-Thinking-ONNX/# 本地流水线生成的产品包（gitignore，可重建）
 ```
@@ -173,10 +171,12 @@ python export_thinking_onnx.py --mode real --component all --model-path /path/to
 
 导出不再“边检查边删除”，而是：
 
-1. 纯只读预检：目标目录、祖先路径、符号链接、权限与 `--force` 授权；
-2. 在暂存目录导出全部组件并通过 ONNX Checker；
-3. 全部成功后，把旧组件与旧全局证据移入备份，再整体安装新产物；
-4. 任何异常反向恢复旧组件与旧证据；回滚本身失败时保留备份目录并报错，不静默清理。
+1. 检查目标目录、祖先路径、符号链接和授权；获取导出锁后、提交前再次确认模式。仅明确为 tiny 的旧产物可默认重建；real 或身份未知产物需显式降级授权。
+2. 在暂存目录导出全部组件并通过 ONNX Checker。
+3. 全部成功后，把旧组件与旧全局证据移入备份，再安装新产物。
+4. 提交完成前的异常会尝试反向恢复旧组件与旧证据；回滚失败保留备份并报错。提交完成后的清理失败只告警并保留残留，不谎称旧产物已恢复。
+
+底层 `export_thinking_onnx.py` 用 `--force --allow-real-overwrite` 才允许 tiny 覆盖 real/未知身份产物；本地 runner 的用户级 `--force` 会传递此授权。普通 `--force` 只表示允许重导出，并不自动授权跨模式覆盖。
 
 并发与残留：
 
@@ -210,12 +210,14 @@ python validate_onnx.py --case moe_block --model artifacts/moe_block/model.onnx
 
 | 运行方式 | 写入文件 | 是否可作为正式验收证据 |
 |---|---|---|
-| 默认（`rtol≤1e-4`、`atol≤1e-5`、完成 Shape Inference） | `validation.json` | ✅ 严格通过 |
-| `--skip-shape-inference`，或容差宽于上述基线 | `validation.diagnostic.json` | ❌ 仅诊断，打包会拒绝 |
-| 校验过程异常（provider 不可用、输入不合法等） | `validation.failure.json` | ❌ 失败记录 |
+| 严格检查执行完毕（成功或数值不一致） | `validation.json` | 仅 `passed=true` 且身份、环境、最新状态均有效时可用 |
+| `--skip-shape-inference`，或容差宽于基线 | `validation.diagnostic.json` | 仅诊断，打包拒绝 |
+| 严格验证进行中或执行异常 | `validation.failure.json` | 带 `attempt_id`、启动时间、产物身份；未完成的新尝试会阻断旧通过 |
+| 诊断执行异常 | `validation.diagnostic.failure.json` | 不顶替正式验收状态 |
 
 - 参数错误（`--case` 传错、provider 不存在、`--atol inf`）会在**写任何报告之前**失败，原有 `validation.json` 保持原样。
-- 只有身份（模型、external、metadata、向量）与判据都通过的 `validation.json` 才会被打包采信；诊断报告不能顶替。
+- 同一组件的验证采用互斥锁，成功记录只能解除同一 `attempt_id` 的 pending；后发失败不能被先发晚完成的成功掩盖。重新成功验证后才恢复验收。
+- 只有身份（模型、external、metadata、向量）、执行环境和最新状态均符合严格判据的 `validation.json` 才会被打包采信；诊断报告不能顶替。Python、平台或依赖变化后需重导出/重验，不允许忽略 `runtime_versions_match=false`。
 
 ### 5.3 算子 / 结构检查
 
@@ -280,6 +282,10 @@ python inspect_onnx.py --model artifacts/tiny_thinker/model.onnx --fail-on-custo
 | `thinker_decode` | `input_ids [B,1]`、`attention_mask [B,past+1]`、`position_ids`、`cache_position`、`past_key/value_0..L-1` | `logits [B,1,V]` + `present_key/value_0..L-1` | 每步回灌 2L 个 KV；past-sequence 动态，不能据此无限延长 |
 
 宿主负责 tokenizer、媒体预处理、多模态占位、位置计算、KV 交接、自回归/采样/停止条件。`cache_position` 是物理 Cache 索引；MRoPE 位置需遵循官方语义，不能把两者无条件混用。
+
+**模态范围不是任意组合**：当前 Prefill 的 `modality_contract=image+audio+text_fixed_counts`，默认视觉 4 token；tiny 音频 3 token，real 默认音频 14 token。必须匹配 metadata 中的计数、位置与 DeepStack 行数。纯文本、纯音频、任意视频组合并未提供通用导出 profile；宿主检查会提前拒绝，不能将缺失视觉特征简单置零来规避。改变组合或计数需要另建并验收 profile。
+
+**音频语义修正（2026-10-08）**：固定 Transformers 的 eager 音频 forward 未实际使用分块 mask；旧 ONNX 的 `cu_seqlens` 因此只是闲置输入。现在采用 `block_diagonal_cu_seqlens_v1`：导出侧用张量计算分段 mask，参考侧用上游 `_prepare_attention_mask` 的独立切片实现临时接入官方层。两侧不得跨分段注意，跨段扰动有回归测试。这是对遗漏隔离语义的明确修正，**不宣称与原始无 mask 的 eager 输出相同，也不是已验证与 FlashAttention 全精度一致**。
 
 **dtype 必须逐组件、逐张量读取当前 ONNX/ORT 接口，不能统一转换成 float32：**
 
@@ -360,7 +366,7 @@ operators/summary.json          各组件节点数 + 全局唯一算子
 | `thinker_prefill` | 160 | logits 4.5e-8 |
 | `thinker_decode`（动态 past 12/14） | 158 | logits 2.2e-8 |
 
-四组件历史合计 **461 节点、41 种标准算子、0 个自定义 domain**；本轮（schema v2，2026-09-23）重导出为 **467 节点、41 种标准算子、0 个自定义 domain**（清单见产品包 `operators/all_operators.csv`）。差异来自本轮语义与接口修复，旧数字不再代表当前产物。
+历史统计：2026-09-22 为 461/41，2026-09-23 为 467/41。**当前 2026-10-08 实测为 479 节点、43 种标准算子、0 个自定义 domain**（Vision 84、Audio 77、Prefill 160、Decode 158）。音频新增分块 mask，使节点和算子种类发生变化；下列旧算子计数仅供历史对照，当前清单以 `operators/all_operators.csv` 为准。
 
 关键算子（编译器/部署方最该关注的）：`MatMul(25) Mul(61) Transpose(44) Unsqueeze(40) Reshape(37) Add(39) Gather(14) Gemm(18) Softmax(6) LayerNormalization(7) Conv(4) Erf(8) TopK(2) GatherND(9) ScatterND(5) ScatterElements(4) NonZero(2) Where(3) Slice(19) Concat(13) ReduceMean(10) ReduceSum(6) Sin/Cos(2+2) Range(1) Shape(2) Expand(4)` 等。
 
@@ -439,7 +445,7 @@ print('outputs:', [(v.name, [d.dim_value for d in v.type.tensor_type.shape.dim])
 "
 ```
 
-> `load_external_data=False` 表示**只读图结构、不读权重**，所以几十 GB 的真实模型也能秒开查看（`inspect_onnx.py` 内部就是这么做的）。
+> `load_external_data=False` 只避免把 external 权重加载成张量。`inspect_onnx.py` 仍会逐个读取权重文件计算 SHA-256；相同文件在一次扫描内只哈希一次。大模型耗时取决于磁盘吞吐和文件体积，不能保证秒开。
 
 ## 8. 局限性（务必阅读）
 
@@ -491,7 +497,11 @@ python run_real_thinking_pipeline.py \
   --minimum-memory-gib 192 --run-end-to-end
 ```
 
-`--preflight-only` 检查 checkpoint 索引、内存门槛、磁盘余量、device/provider 可用性和非权重资源；它不验证目标 provider 是否支持该图的全部算子内核。
+`--preflight-only` **不加载大模型**：读取 config/index 和 safetensors 头部，核对 tensor 到分片映射、精度和文件完整性；实际查询 RAM 总量/可用量、CUDA 编号/可用显存、输出磁盘剩余空间，并检查整套非权重资源。导出磁盘预算为约 `2.3 × checkpoint 文件大小 + 1 GiB` 的新增空间；已导出后的 E2E 只要求 64 MiB 报告空间，不再预留一次导出空间。同 GPU 的 PyTorch+ORT 驻留与专家选择矩阵另计入显存预算，预算仍不是实测峰值保证。
+
+runner 默认从 `--model-path` 获取配置/Processor；`--source-dir` 可显式指定另一整套来源，必须与 checkpoint 的 config 相同，预检与打包使用同一目录。实际加载时会检查 `missing_keys/unexpected_keys/mismatched_keys/conversion_errors/error_msgs`，发现非空即失败，不允许随机补齐缺失权重后冒充官方模型。
+
+预检不执行完整图，不能证明 provider 的全部算子内核和数值精度可用。CUDA EP 当前用 ORT 默认 GPU 0，PyTorch 的 `cuda:N` 另行配置；不同设备和同设备预算会分别计算。
 
 以上是目标机迁移命令，不是本机已执行结果，也不保证 FP16 CPU 内核全部可用。选择 GPU 时应同时按实际需求配置 `--device cuda` 与 `--provider CUDAExecutionProvider`，并确认相应 torch、ORT GPU、驱动及显存。默认不带 `--run-end-to-end` 的流程缺少最终验收，组件通过也应保持 `unverified-real-artifacts` 并非零退出。
 
@@ -554,8 +564,8 @@ git checkout <commit> -- <file>   # 恢复单个文件
 - **换 Shape**：修改 profile 后重导出并重新验收，不复用旧 schema 或旧报告；换模型还需专门适配，见第 14 节。
 - **BF16 喂数或 kernel 错误**：区分数据交换失败与算子内核缺失；当前有位保持 NPZ/IOBinding 路径，不将 BF16 偷换 FP32。CPU 小图交换成功不代表 Qwen 整图通过，换 CUDA 或 FP16 也须重新验收。
 - **打包 `unverified-real-artifacts` 或非零退出**：检查是否缺 real 端到端、参考链、当前 schema v2 绑定或必要配置。`--run-end-to-end` 是必要流程选项，不是保证成功的开关。
-- **`validation.json` 没有更新**：你可能用了 `--skip-shape-inference` 或更宽的容差，此时结果写入 `validation.diagnostic.json`；异常写入 `validation.failure.json`。只有严格通过才更新 `validation.json`。
-- **出现 `.export.lock` 或 `.transaction-*`**：前者是并发互斥锁，正常结束不会遗留；后者是未正常结束的事务备份，工具不会自动删除，请先检查备份内容再手工处理。
+- **`validation.json` 没有更新**：诊断模式写 `validation.diagnostic.json`；严格执行异常写独立失败记录。严格检查完成后，无论数值通过或失败均写 `validation.json`，必须读取 `passed` 和最新尝试状态，不以文件存在判成功。
+- **出现 `.export.lock` 或 `.transaction-*`**：锁文件正常结束会保留，真正互斥由系统文件锁控制，切勿因为文件存在就删除它。事务残留可能来自中断或提交后清理失败，需先辨别当前已安装产物与备份，不自动清理未知残留。
 - **另一个导出进程正在使用目标目录**：同一产品目录不允许并发导出，请等待或改用独立目录。
 
 ## 12. 设计决策与实现选择

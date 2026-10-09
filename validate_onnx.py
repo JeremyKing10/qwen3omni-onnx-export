@@ -6,6 +6,7 @@ import math
 import os
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +16,10 @@ import onnxruntime as ort
 
 from qwen3_omni_onnx_cases import SUPPORTED_CASES, WORKSPACE, file_sha256, write_json
 from qwen3_omni_thinking_components import THINKING_COMPONENTS
+from export_onnx import output_lock
 from onnx_artifact_utils import (
     artifact_identity, check_providers, load_tensor_archive, run_ort_session,
-    safe_path, validate_tolerances, verify_artifact_identity,
+    runtime_identity, safe_path, validate_tolerances, verify_artifact_identity,
 )
 
 KNOWN_CASES = tuple(SUPPORTED_CASES) + tuple(THINKING_COMPONENTS)
@@ -155,11 +157,17 @@ def validate_vector(
     }
 
 
-def write_failure(report_path: Path, model_path: Path, error: BaseException, started: float) -> None:
+def write_failure(report_path: Path, model_path: Path, error: BaseException, started: float,
+                  identity: dict[str, Any], attempt_started_ns: int, attempt_id: str, *, state: str = "failed") -> None:
     write_json(
         report_path,
         {
             "passed": False,
+            "artifact_identity": identity,
+            "attempt_started_ns": attempt_started_ns,
+            "attempt_id": attempt_id,
+            "state": state,
+            "runtime_identity": runtime_identity(),
             "model": str(model_path),
             "error": f"{type(error).__name__}: {error}",
             "elapsed_seconds": time.perf_counter() - started,
@@ -167,8 +175,7 @@ def write_failure(report_path: Path, model_path: Path, error: BaseException, sta
     )
 
 
-def main() -> None:
-    args = parse_args()
+def validate_model(args: argparse.Namespace) -> None:
     validate_tolerances(args.rtol, args.atol)
     requested_providers = args.providers or ["CPUExecutionProvider"]
     check_providers(requested_providers)
@@ -176,8 +183,10 @@ def main() -> None:
     model_dir = model_path.parent
     diagnostic = args.skip_shape_inference or args.rtol > 1e-4 or args.atol > 1e-5
     report_path = safe_path(WORKSPACE, model_dir / ("validation.diagnostic.json" if diagnostic else "validation.json"))
-    failure_path = safe_path(WORKSPACE, model_dir / "validation.failure.json")
+    failure_path = safe_path(WORKSPACE, model_dir / ("validation.diagnostic.failure.json" if diagnostic else "validation.failure.json"))
     started = time.perf_counter()
+    attempt_started_ns = time.time_ns()
+    attempt_id = uuid.uuid4().hex
     metadata = load_metadata(model_dir)
     if args.case and metadata["case"] != args.case:
         raise ValueError(f"case 不一致：参数={args.case} 元数据={metadata['case']}")
@@ -189,6 +198,8 @@ def main() -> None:
     if report_path in protected or failure_path in protected:
         raise ValueError("验证报告路径与模型、external data 或测试向量冲突")
     model_hash = identity["model_sha256"]
+    write_failure(failure_path, model_path, RuntimeError("verification in progress or interrupted"), started,
+                  identity, attempt_started_ns, attempt_id, state="pending")
     try:
         onnx.checker.check_model(str(model_path), full_check=True)
         shape_inference: dict[str, Any] = {
@@ -263,6 +274,10 @@ def main() -> None:
         report = {
             "passed": passed,
             "artifact_identity": identity,
+            "attempt_started_ns": attempt_started_ns,
+            "attempt_id": attempt_id,
+            "completed_ns": time.time_ns(),
+            "runtime_identity": runtime_identity(),
             "validation_level": "diagnostic" if diagnostic else "strict",
             "case": metadata["case"],
             "profile": metadata.get("profile"),
@@ -287,8 +302,8 @@ def main() -> None:
             "elapsed_seconds": time.perf_counter() - started,
         }
         write_json(report_path, report)
-    except Exception as error:
-        write_failure(failure_path, model_path, error, started)
+    except (Exception, KeyboardInterrupt) as error:
+        write_failure(failure_path, model_path, error, started, identity, attempt_started_ns, attempt_id)
         raise
 
     for vector in report["test_vectors"]:
@@ -301,6 +316,15 @@ def main() -> None:
     print(f"[{'OK' if report['passed'] else 'FAIL'}] report={report_path}")
     if not report["passed"]:
         raise SystemExit(1)
+
+
+def main() -> None:
+    args = parse_args()
+    validate_tolerances(args.rtol, args.atol)
+    check_providers(args.providers or ["CPUExecutionProvider"])
+    model_path = safe_path(WORKSPACE, args.model, must_exist=True)
+    with output_lock(model_path.parent / "validation"):
+        validate_model(args)
 
 
 if __name__ == "__main__":

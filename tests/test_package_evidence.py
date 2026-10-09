@@ -127,6 +127,8 @@ class PackageEvidenceTests(unittest.TestCase):
             "tolerances": {"rtol": 1e-4, "atol": 1e-5}, "comparisons": comparisons,
             "reference_scope": "official_top_level_with_raw_synthetic_features",
             "reference_positions": "official_forward_independent_mrope_and_cache",
+            "runtime_identity": utils.runtime_identity(),
+            "audio_attention_contract": "block_diagonal_cu_seqlens_v1",
         }
         self.write_json(self.product / "validation" / "end_to_end.json", end_to_end)
         return self.create_sources(), components, end_to_end
@@ -296,6 +298,27 @@ class PackageEvidenceTests(unittest.TestCase):
         failure["artifact_identities"] = {}
         self.write_json(path, failure)
         self.assertTrue(package.build_package(self.args(source), self.product, {})["passed"])
+
+    def test_environment_mismatch_blocks_package(self):
+        source, _, _ = self.create_complete_product()
+        current = utils.source_snapshot(); current["packages"]["onnxruntime"] = "unverified-version"
+        with patch.object(package, "source_snapshot", return_value=current):
+            self.assertFalse(package.build_package(self.args(source), self.product, {})["passed"])
+
+    def test_summary_wrong_counts_rejected_even_with_intact_csv(self):
+        source, _, _ = self.create_complete_product()
+        path = self.product / "operators/summary.json"
+        report = json.loads(path.read_text()); report["total_node_count"] = 1
+        self.write_json(path, report)
+        self.assertFalse(package.build_package(self.args(source), self.product, {})["passed"])
+
+    def test_new_single_model_failure_blocks_packaging(self):
+        root = self.create_component()
+        with patch.object(validate_onnx.onnx.checker, "check_model", side_effect=RuntimeError("execution failed")):
+            with self.assertRaises(RuntimeError):
+                self.invoke(validate_onnx, "--model", root / "model.onnx")
+        with self.assertRaisesRegex(RuntimeError, "最新严格验证"):
+            package.collect_component(self.product, "vision_encoder")
 
     def test_main_failure_replaces_stale_success_manifest(self):
         self.product.mkdir()

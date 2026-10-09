@@ -43,7 +43,12 @@
 | 修复完成 | “全部已修好” | 修复后没有新增回归 | 每个修复配一条反向用例 |
 | 汇报即状态 | “已完成”“已落盘” | 未看 `git status`/文件内容 | 以磁盘状态与测试结果为准 |
 | 范围膨胀 | “数学等价”“无需改代码”“唯一阻塞” | 从有限样例推广到全规模/全 dtype | 改为“在 X 配置、Y 输入、Z 环境下通过” |
-| 覆盖错觉 | “测试很全” | 新模块无测试（当前：4 个模块零测试） | 列出“模块 ↔ 测试”矩阵 |
+| 覆盖错觉 | “测试很全” | 新模块无测试（2026-09-23 曾有 4 个模块零测试） | 列出“模块 ↔ 测试”矩阵 |
+| 打印即检查 | “预检 OK” | 打印内存预算却从未读取实际 RAM，磁盘不足仍返回成功 | mock 不足资源，并断言机器查询确实被调用、失败码真实非零 |
+| 文件完整即加载完整 | “分片哈希都对” | 上游加载缺参只警告并随机补参数 | 使用真实小 safetensors 缺参负例，检查 loading report，而非只测文件存在 |
+| 官方参考永远正确 | “跟官方一样所以没有问题” | 固定官方 eager 也遗漏了分块 mask | 加跨分段扰动不变量；必要修正必须明确契约和参考适配，不冒称原始路径等价 |
+| 修复新增时序盲区 | “失败已写 sidecar” | 成功结束时间冒充启动时间，先发晚完成掩盖后发失败 | 用 attempt ID、互斥和后发失败测试，区分 pending 与完成状态 |
+| 预算越保守越正确 | “多预留一份更安全” | E2E 验证又要求整套导出磁盘预算，预检通过却晚失败 | 按执行阶段计算新增占用，而非复制同一保护阈值 |
 
 ---
 
@@ -59,7 +64,7 @@
 
 本项目应逐条检查：模态注入、位置计算、掩码构造、缓存组装、特征提取。
 
-**判据**：若期望值由被测实现自身生成，这条“通过”没有证据价值。
+**判据**：先划定被测边界。Wrapper 的 PyTorch 输出可作为 ONNX 转换测试的参考，这对转换忠实度有价值；但不能用来证明 Wrapper 自身的语义正确。后者须独立官方路径或不变量检查。参考端与被测端共用错误宿主逻辑时，比较无法发现该共同错误。
 
 ### 3.2 故障注入 / 变异测试
 
@@ -116,8 +121,8 @@
 | `qwen3_omni_thinking_components.py` / `validate_thinking_pipeline.py` | ✅ `test_semantics.py` |
 | `build_thinking_package.py` / `aggregate_operators.py` | ✅ `test_package_evidence.py` |
 | `validate_onnx.py` / `inspect_onnx.py` | ✅（经 `test_artifact_utils.py` 调用） |
-| `export_onnx.py` / `export_thinking_onnx.py` | ❌ **无** |
-| `run_local_thinking_pipeline.py` / `run_real_thinking_pipeline.py` | ❌ **无** |
+| `export_onnx.py` / `export_thinking_onnx.py` | `test_export_safety.py`：暂存/提交失败、清理、锁、未知身份授权；`test_semantics.py` 含真实音频导出与 ORT 边界变化 |
+| `run_local_thinking_pipeline.py` / `run_real_thinking_pipeline.py` | `test_runners.py`：硬件不足模拟、真实 safetensors 索引/缺参加载、资源来源传递、离线与授权；不是官方 30B 实测 |
 
 **空白格就是下一个“看似完备”的入口。**
 
@@ -140,20 +145,22 @@
 
 ## 5. 当前版本的“已验证 / 未验证”边界（诚实账本）
 
-**已实测（本机 tiny，48 GiB）**
+**已实测（2026-10-08，本机 tiny，48 GiB）**
 
-- 59 项持久 unittest 全绿；
-- 一键 tiny 全流程退出码 0，manifest `passed=true`、`status=tiny-interface-validation-only`；
-- 467 节点 / 41 种标准算子 / 0 自定义 domain；
-- 端到端 3 步 Decode，误差 vision 5.59e-09、audio 1.16e-09、prefill 8.34e-07、decode 8.34e-07；
-- 事务回滚、证据失效化、并发锁（一次性探测验证正确）；
-- 只读预检失败路径清晰。
+- 97 项持久 unittest 通过；9 月的 59 项/467 节点为历史记录，不代表当前图。
+- 一键 tiny 全流程退出码 0，manifest `passed=true`、`status=tiny-interface-validation-only`。
+- 479 节点 / 43 类标准算子 / 0 自定义 domain；Audio 从 65 增至 77 节点，`cu_seqlens` 现在实际参与分块 mask。
+- 三步 Decode：vision 5.59e-09、audio 6.98e-10、prefill/decode 8.34e-07（最大绝对误差）。
+- 新增导出事务和 runner 常驻测试，包括硬件不足模拟、实际小 checkpoint 缺参加载拒绝、后发失败、清理失败、未知身份和锁内授权。
+- 阶段 review 又发现三项本轮新问题：{} 身份仍放行、E2E 重复磁盘预算、结束时间掩盖后发失败；均修复并新增回归，最后静态复核未发现新增确定阻断。
+- 不把硬件 mock 成功当作目标机器预检已经通过；不把无新增发现说成“证明再无新问题”。
 
 **未验证（不得表述为已完成）**
 
 - 官方 30B 权重导出与验收；
 - FP16/BF16 全图在目标 provider 的内核兼容性；
-- 导出/运行器四个模块的行为（无常驻测试）；
+- 导出/运行器在真实大规模、SIGKILL/掉电、全部并发组合下的行为（本轮已有常驻边界测试，不覆盖所有状态）；
+- 纯文本、纯音频和任意视频组合的通用 Prefill profile（当前明确仅支持固定 image+audio+text）；
 - real 代码路径（仅小配置模拟）；
 - 算子/Shape/dtype 契约在真实配置下的取值；
 - 源码 bytes 归档（当前仅 hash/版本/git）；
@@ -240,4 +247,7 @@ git status --short && git diff --stat           # 以磁盘状态为准，不以
 | 2026-09-23 | `616c5a4` → `ab2b07e` | 创建本文。记录六类完备幻觉、七种发掘方法、十项检查单，以及当前“已验证/未验证”账本 |
 | 2026-09-23 | 同上 | 实证案例：模态错位（PT/ORT 同错仍通过，对齐后 logits 差 0.2558）、参考复制 Wrapper、BF16 结论被 IOBinding 推翻、`int(rope_delta)` 截断 0.3、预检即删除、旧报告可复用、宽容差下 999 vs 1 通过 |
 | 2026-09-23 | 同上 | 新增第 7 节（交接用法与输出契约）、第 8 节（维护规则与日志） |
-| 2026-09-23 | 复查 | 记录当前 4 个模块无测试（`export_onnx.py`、`export_thinking_onnx.py`、`run_local_thinking_pipeline.py`、`run_real_thinking_pipeline.py`）；事务/回滚/并发锁仅经一次性探测验证，无常驻回归 |
+| 2026-09-23 | 复查 | 记录当时 4 个模块无测试（`export_onnx.py`、`export_thinking_onnx.py`、`run_local_thinking_pipeline.py`、`run_real_thinking_pipeline.py`）；事务/回滚/并发锁仅经一次性探测验证，无常驻回归 |
+| 2026-10-08 | 以 `c18d15a` 为基线修复 | 预检改为实际读取机器资源和权重头部；严格拒绝 missing/unexpected 加载；失败尝试、运行环境和算子汇总真正参与打包 gate；补齐事务及 runner 回归 |
+| 2026-10-08 | 音频契约修正 | 固定官方 eager 同样遗漏分段隔离，旧 PT/ORT 比较不能发现；导出张量 mask 与上游切片参考分别实现，跨段扰动及真实 ONNX 边界变化回归；文档明确不是原无 mask eager 等价 |
+| 2026-10-08 | 二次复核 | 发现本轮新引入的未知 JSON 身份、E2E 重复磁盘预留和验证时序缺陷；逐项修复并新增回归。97 项测试与 tiny 全流程通过，479/43/0；未宣称官方 30B 或全部输入组合通过 |

@@ -82,6 +82,44 @@ class ArtifactTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             utils.require_strict_validation(report, utils.artifact_identity(path))
 
+    def test_latest_failed_verification_blocks_old_success_until_retested(self):
+        path = self.create_model(); self.run_validate(path)
+        old = json.loads((self.root / "validation.json").read_text()); identity = utils.artifact_identity(path)
+        with patch.object(validate_onnx.onnx.checker, "check_model", side_effect=RuntimeError("execution failed")):
+            with self.assertRaises(RuntimeError):
+                self.run_validate(path)
+        self.assertEqual(old, json.loads((self.root / "validation.json").read_text()))
+        with self.assertRaisesRegex(RuntimeError, "最新严格验证"):
+            utils.require_latest_validation(path, old, identity)
+        self.run_validate(path)
+        new = json.loads((self.root / "validation.json").read_text())
+        utils.require_latest_validation(path, new, identity)
+
+    def test_same_attempt_pending_resolved_but_newer_failure_blocks(self):
+        path = self.create_model(); self.run_validate(path)
+        report = json.loads((self.root / "validation.json").read_text()); identity = utils.artifact_identity(path)
+        utils.require_latest_validation(path, report, identity)
+        failure = {"artifact_identity": identity, "attempt_id": "later", "state": "failed",
+                   "attempt_started_ns": report["attempt_started_ns"] + 1}
+        (self.root / "validation.failure.json").write_text(json.dumps(failure))
+        report["completed_ns"] = failure["attempt_started_ns"] + 999
+        with self.assertRaisesRegex(RuntimeError, "最新严格验证"):
+            utils.require_latest_validation(path, report, identity)
+
+    def test_same_model_verification_is_mutually_exclusive(self):
+        path = self.create_model()
+        with validate_onnx.output_lock(self.root / "validation"):
+            with self.assertRaisesRegex(RuntimeError, "另一导出进程"):
+                self.run_validate(path)
+        self.assertFalse((self.root / "validation.json").exists())
+
+    def test_verification_environment_change_rejected(self):
+        path = self.create_model(); self.run_validate(path)
+        report = json.loads((self.root / "validation.json").read_text())
+        report["runtime_identity"]["packages"]["onnxruntime"] = "wrong"
+        with self.assertRaisesRegex(RuntimeError, "环境"):
+            utils.require_strict_validation(report, utils.artifact_identity(path))
+
     def test_changed_weights_rejected_before_execution(self):
         path = self.create_model()
         identity = utils.artifact_identity(path)

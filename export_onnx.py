@@ -6,6 +6,7 @@ import os
 import shutil
 import tempfile
 import time
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator
@@ -83,8 +84,16 @@ def output_lock(root: Path) -> Iterator[None]:
 def export_transaction(
     targets: dict[str, Path], force: bool, export: Callable[[str, Path], None],
     *, evidence: tuple[Path, ...] = (), lock_root: Path,
+    authorize: Callable[[], None] | None = None,
 ) -> None:
+    if not targets:
+        raise ValueError("导出事务没有目标")
     def preflight() -> None:
+        if authorize is not None:
+            authorize()
+        for name in targets:
+            if Path(name).name != name or name in {".", ".."}:
+                raise ValueError("不安全的暂存组件名")
         for target in targets.values():
             check_output_dir(target, force)
         for path in evidence:
@@ -132,7 +141,10 @@ def export_transaction(
             raise
         finally:
             if not keep_backup:
-                shutil.rmtree(transaction)
+                try:
+                    shutil.rmtree(transaction)
+                except OSError as error:
+                    warnings.warn(f"事务已提交或回滚，但清理失败；请检查残留目录 {transaction}：{error}", RuntimeWarning)
 
 
 def export_case(args: argparse.Namespace, output_dir: Path) -> None:

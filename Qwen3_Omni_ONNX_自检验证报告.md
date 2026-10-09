@@ -25,7 +25,35 @@
 | 真实媒体与生成质量 | 合成张量测试不是质量基准 |
 | 完整 Qwen BF16 的 CPU/CUDA 执行 | 数据交换支持不等于所有算子内核支持，换 CUDA 不保证成功 |
 
-### 0.1 本轮验收（2026-09-23）
+### 0.1 本轮验收（2026-10-08）
+
+本轮在 macOS arm64、48 GiB、Python 3.11.9 / torch 2.8.0 / ONNX 1.22.0 / ORT 1.30.0 中执行：
+
+```bash
+HF_HUB_OFFLINE=1 HF_HUB_DISABLE_PROGRESS_BARS=1 .venv/bin/python -B -m unittest discover -s tests
+HF_HUB_OFFLINE=1 .venv/bin/python -B run_local_thinking_pipeline.py --offline
+```
+
+两条命令均直接记录 Python 退出码 **0**，不使用 `tail` 的退出码代替。
+
+| 验收项 | 实测结果 |
+|---|---|
+| 持久 unittest | 97 项通过：公共证据 28、打包 20、语义及 E2E 21、事务 12、runner/加载 16 |
+| 四组件重导出 | Vision 84、Audio 77、Prefill 160、Decode 158，合计 479 节点、43 类标准算子、0 自定义 domain |
+| 完整包 | `passed=true`、`status=tiny-interface-validation-only`；源码/环境、数值参考、E2E、汇总检查均通过 |
+| 音频修正 | `cu_seqlens` 现在被图中 Slice 等节点实际使用；`block_diagonal_cu_seqlens_v1` 分块隔离生效 |
+| 独立参考 | 官方顶层原始合成特征；音频参考显式接入上游切片块掩码，不复用导出侧张量 mask，也不冒称原始无掩码 eager 等价 |
+| E2E 最大绝对误差 | vision 5.58794e-09；audio 6.98492e-10；prefill 和三步 decode 均 8.34465e-07 |
+| 早期回归 | rmsnorm、moe_block、tiny_thinker 的导出/验证/inspect 共 9 条命令退出码均为 0 |
+| 权重完整加载 | 小配置真实 safetensors 缺 LM Head 时拒绝；补齐后严格加载成功，未加载官方 30B |
+| 预检 | RAM/CUDA/磁盘失败场景由 mock 硬件状态模拟，真实本机无 GPU，不能把模拟成功当目标机已通过 |
+| 阶段复核 | 发现并修复未知 JSON 身份放行、E2E 重复磁盘预留、验证尝试时序问题；最后只读复核未发现新增确定阻断 |
+
+本轮图哈希前缀：Vision `13e69ab2d6a32304`、Audio `125c365e3547f50b`、Prefill `c766ff5dd45756c48`、Decode `11454fe020eddef2e`。哈希只用于识别这批产物，不证明语义。
+
+固定 Prefill **只支持 image+audio+text 且视觉/音频 token 数固定**。没有为纯文本、纯音频、任意视频组合补通用 profile；这些会在宿主契约检查时明确拒绝。官方 30B、真实 CUDA、完整低精度图、全部动态长度与真实媒体质量仍未验收，不能保证不存在其他潜在问题。
+
+### 0.2 历史验收（2026-09-23）
 
 - 持久回归入口：`python -B -m unittest discover -s tests -v`，测试位于 `tests/test_*.py`，公共产物逻辑在 `onnx_artifact_utils.py`。
 - 已有局部测试事实：内存内 CPU IOBinding Cast/Identity 小图与 BF16 NPZ bit-preserving 往返成功；此结论仅覆盖 BF16 数据交换，不代表完整 Qwen BF16 内核可用。
@@ -36,7 +64,7 @@
 .venv/bin/python -B run_local_thinking_pipeline.py --offline
 ```
 
-- 持久 unittest：**59 项全部通过**（公共证据 24、语义 12、端到端证据 7、打包证据 16 分布在三个文件中）。
+- 持久 unittest：**59 项全部通过**（公共证据 24、语义 11、端到端证据 7、打包证据 17 分布在三个文件中；原记录的分类数有误，总数 59 不变）。
 - 一键 tiny 全流程：退出码 **0**，并生成 `status=tiny-interface-validation-only`、`passed=true` 的 manifest。
 - 产物统计（schema v2）：`vision_encoder 84`、`audio_encoder 65`、`thinker_prefill 160`、`thinker_decode 158`，合计 **467 节点、41 种标准算子、0 个自定义 domain**。
 - 模型哈希前缀：`vision 97198aa0e3644a7b`、`audio 3678ad997d691a9d`、`prefill 8824b3c12dd642de`、`decode 5d3fd0358285e4fe`。
@@ -285,7 +313,7 @@ python run_real_thinking_pipeline.py \
   --minimum-memory-gib 192 --run-end-to-end --preflight-only
 ```
 
-命令约定：`--offline` 只影响 7 个非权重资源的获取方式；`--device` 是 PyTorch 设备、`--provider` 是 ONNX Runtime 后端，需分别确认；导出失败会写 `validation.failure.json` / `end_to_end.failure.json` 并保留旧报告，宽容差结果只写入 `validation.diagnostic.json`。
+命令约定：`--offline` 影响非权重资源获取；real runner 默认使用本地 checkpoint 中整套配置，显式 `--source-dir` 会传递到打包。`--device` 是 PyTorch 设备、`--provider` 是 ORT 后端。单模型严格验证进行中/失败写 `validation.failure.json`，完整比较结束后写 `validation.json`（成功或失败）；诊断写独立 diagnostic 报告。端到端执行失败写 `validation/end_to_end.failure.json`。这些由验证器生成，不是导出器自动生成；旧报告是否可用必须检查身份、环境及最新尝试状态。
 
 反向场景使用 `tests/test_*.py` 的持久 unittest，在临时隔离目录验证，不需要照抄历史 `rm -rf/dd` 操作。`--case` 调用错误应保留有效旧报告；产物身份或绑定失效应阻止旧报告继续被采信。具体覆盖以本轮真实 unittest 输出为准。
 

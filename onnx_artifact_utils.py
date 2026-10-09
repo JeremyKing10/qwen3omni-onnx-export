@@ -237,7 +237,30 @@ def check_providers(providers: list[str]) -> None:
         raise RuntimeError(f"ORT provider 不可用：{sorted(unavailable)}；可用：{ort.get_available_providers()}")
 
 
+def runtime_identity() -> dict[str, Any]:
+    packages = {}
+    for name in ("torch", "transformers", "onnx", "onnxscript", "numpy", "ml_dtypes"):
+        packages[name] = importlib.metadata.version(name)
+    packages["onnxruntime"] = ort.__version__
+    return {"python": platform.python_version(), "platform": platform.platform(), "packages": packages}
+
+
+def require_latest_validation(model_path: Path, report: dict[str, Any], identity: dict[str, Any]) -> None:
+    failure_path = safe_path(model_path.parent, model_path.parent / "validation.failure.json")
+    if failure_path.is_file():
+        failure = json.loads(failure_path.read_text(encoding="utf-8"))
+        if failure.get("artifact_identity") == identity:
+            if (failure.get("state") == "pending" and report.get("passed") is True
+                    and report.get("attempt_id") and failure.get("attempt_id") == report["attempt_id"]):
+                return
+            failed_at, passed_at = failure.get("attempt_started_ns"), report.get("attempt_started_ns")
+            if type(failed_at) is not int or type(passed_at) is not int or failed_at >= passed_at:
+                raise RuntimeError("该产物最新严格验证失败或中断，旧通过报告不可作为当前验收")
+
+
 def require_strict_validation(report: dict[str, Any], identity: dict[str, Any]) -> None:
+    if report.get("runtime_identity") != runtime_identity():
+        raise RuntimeError("验证报告环境与当前环境不一致或未记录；请在当前环境重验")
     if report.get("passed") is not True or report.get("artifact_identity") != identity:
         raise RuntimeError("数值验证报告未通过或身份与当前产物不一致")
     if report.get("case") != identity["case"] or report.get("model_sha256") != identity["model_sha256"]:
@@ -354,14 +377,67 @@ def run_ort_session(
     return tuple(results)
 
 
+def check_execution_resources(
+    checkpoint: dict[str, Any], package_dir: Path, minimum_memory_gib: float,
+    device: str, provider: str, *, end_to_end: bool = False, sequence_length: int = 32,
+    export_stage: bool = True,
+) -> dict[str, Any]:
+    import psutil
+    import shutil
+    import torch
+
+    floor = 192 if end_to_end else 128
+    if type(minimum_memory_gib) not in (int, float) or not math.isfinite(minimum_memory_gib) or minimum_memory_gib < floor:
+        raise ValueError(f"--minimum-memory-gib 必须为至少 {floor} 的有限数值")
+    package_dir = safe_path(WORKSPACE, package_dir)
+    if package_dir == WORKSPACE:
+        raise ValueError("产品目录不能是工作区根目录")
+    check_providers([provider])
+    target = torch.device(device)
+    if target.type not in {"cpu", "cuda"} or (target.type == "cpu" and target.index is not None):
+        raise ValueError("当前仅支持 cpu 或 cuda[:N] 设备")
+    weights = checkpoint["weight_bytes"]
+    cfg = checkpoint["config"]["thinker_config"]["text_config"]
+    selected = (sequence_length + 2) * cfg["num_experts_per_tok"] * 3 * cfg["hidden_size"] * cfg["moe_intermediate_size"] * 2
+    gib = 1024**3
+    memory = psutil.virtual_memory()
+    required_available = max(minimum_memory_gib * .75 * gib, weights * (2 if target.type == "cpu" else 1) + selected + 8 * gib)
+    if memory.total < minimum_memory_gib * gib or memory.available < required_available:
+        raise RuntimeError(f"内存不足：总量 {memory.total/gib:.1f} GiB，可用 {memory.available/gib:.1f} GiB；"
+                           f"要求总量 >= {minimum_memory_gib:.0f} GiB，可用 >= {required_available/gib:.1f} GiB")
+    cuda_needs: dict[int, float] = {}
+    if target.type == "cuda" or provider == "CUDAExecutionProvider":
+        if not torch.cuda.is_available():
+            raise RuntimeError("请求 CUDA，但当前 torch.cuda 不可用")
+        if target.type == "cuda":
+            index = target.index if target.index is not None else torch.cuda.current_device()
+            cuda_needs[index] = weights * 1.2 + selected
+        if provider == "CUDAExecutionProvider":
+            # The CLI currently uses ORT's default CUDA device (0).
+            cuda_needs[0] = (cuda_needs.get(0, 0) if end_to_end else 0) + weights * 1.2 + selected
+        for index, required in cuda_needs.items():
+            if index < 0 or index >= torch.cuda.device_count():
+                raise RuntimeError(f"不存在的 CUDA 设备：cuda:{index}")
+            free, _ = torch.cuda.mem_get_info(index)
+            if free < required:
+                raise RuntimeError(f"cuda:{index} 可用显存 {free/gib:.1f} GiB < 预算 {required/gib:.1f} GiB")
+    disk_root = package_dir.parent
+    while not disk_root.exists():
+        disk_root = disk_root.parent
+    free_disk = shutil.disk_usage(disk_root).free
+    disk_required = int(weights * 2.3 + gib) if export_stage else 64 * 1024**2
+    if free_disk < disk_required:
+        raise RuntimeError(f"输出磁盘 {disk_root} 可用 {free_disk/gib:.1f} GiB < 新产物暂存预算 {disk_required/gib:.1f} GiB")
+    return {"ram_total_gib": memory.total/gib, "ram_available_gib": memory.available/gib,
+            "required_available_gib": required_available/gib, "output_filesystem": str(disk_root),
+            "disk_free_gib": free_disk/gib, "disk_required_gib": disk_required/gib,
+            "cuda_required_gib": {str(k): v/gib for k, v in cuda_needs.items()},
+            "scope": "conservative budget, not a full graph/kernel or peak-memory proof"}
+
+
 def source_snapshot() -> dict[str, Any]:
     files = sorted(WORKSPACE.glob("*.py")) + [WORKSPACE / "requirements.txt"]
-    versions = {}
-    for name in ("torch", "transformers", "onnx", "onnxruntime", "onnxscript", "numpy", "ml_dtypes"):
-        try:
-            versions[name] = importlib.metadata.version(name)
-        except importlib.metadata.PackageNotFoundError:
-            versions[name] = None
+    versions = runtime_identity()["packages"]
     result = subprocess.run(["git", "-C", str(WORKSPACE), "rev-parse", "HEAD"], capture_output=True, text=True)
     status = subprocess.run(["git", "-C", str(WORKSPACE), "status", "--porcelain", "--untracked-files=no"], capture_output=True, text=True)
     return {

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+from collections import Counter
 import json
 import math
 import shutil
@@ -14,6 +16,8 @@ from aggregate_operators import atomic_text, collect_operator_report
 from onnx_artifact_utils import (
     file_sha256,
     require_strict_validation,
+    require_latest_validation,
+    runtime_identity,
     safe_path,
     source_snapshot,
     verify_artifact_identity,
@@ -124,10 +128,13 @@ def collect_component(package_dir: Path, component: str) -> dict[str, Any]:
     if metadata.get("model_file") != "model.onnx" or not isinstance(metadata.get("interface"), dict):
         raise RuntimeError(f"{component} 导出接口元数据无效")
     real = profile == "real-fixed-shape"
+    if real and metadata.get("loading_verified") is not True:
+        raise RuntimeError("真实权重未通过完整加载检查")
     if metadata.get("official_weights_included") is not real or metadata.get("randomly_initialized") is not (not real):
         raise RuntimeError(f"{component} 权重声明与 profile 不一致")
     identity = verify_artifact_identity(model_path, validation.get("artifact_identity"))
     require_strict_validation(validation, identity)
+    require_latest_validation(model_path, validation, identity)
     operators = collect_operator_report(package_dir, component)
     if operators["artifact_identity"] != identity:
         raise RuntimeError(f"{component} inspect 与 validation 不属于同一完整制品")
@@ -169,6 +176,8 @@ def collect_component(package_dir: Path, component: str) -> dict[str, Any]:
         "interface": metadata["interface"],
         "validation": f"validation/{component}.json",
         "operators": f"operators/{component.replace('_encoder', '')}.json",
+        "operator_counts": operators["operator_counts"],
+        "node_count": operators["graph"]["node_count"] + operators["graph"]["function_node_count"],
         "validated": True,
         "custom_domains": [],
     }
@@ -180,6 +189,10 @@ def finite_nonnegative(value: Any) -> bool:
 
 def end_to_end_matches(report: dict[str, Any] | None, components: dict[str, Any]) -> bool:
     if not isinstance(report, dict) or report.get("passed") is not True:
+        return False
+    if report.get("runtime_identity") != runtime_identity():
+        return False
+    if report.get("audio_attention_contract") != "block_diagonal_cu_seqlens_v1":
         return False
     if report.get("evidence_schema_version") != 2 or set(components) != set(THINKING_COMPONENTS):
         return False
@@ -250,7 +263,9 @@ def snapshot_comparison(exported: dict[str, Any], current: dict[str, Any]) -> di
         "missing_evidence_sources": missing,
         "changed_evidence_sources": changed_critical,
         "evidence_sources_match": not missing and not changed_critical,
-        "runtime_versions_match": exported.get("packages") == current.get("packages"),
+        "runtime_versions_match": bool(exported.get("packages")) and all(
+            exported.get(key) == current.get(key) for key in ("packages", "python", "platform")
+        ),
     }
 
 
@@ -307,7 +322,7 @@ def build_package(args: argparse.Namespace, package_dir: Path, previous: dict[st
         component: snapshot_comparison(entry["source_snapshot"], snapshot)
         for component, entry in components.items()
     }
-    source_evidence_valid = all(check["evidence_sources_match"] for check in snapshot_checks.values())
+    source_evidence_valid = all(check["evidence_sources_match"] and check["runtime_versions_match"] for check in snapshot_checks.values())
     end_to_end_path = safe_path(package_dir, package_dir / "validation" / "end_to_end.json")
     end_to_end = json.loads(end_to_end_path.read_text(encoding="utf-8")) if end_to_end_path.is_file() else None
     end_to_end_valid = end_to_end_matches(end_to_end, components)
@@ -331,6 +346,22 @@ def build_package(args: argparse.Namespace, package_dir: Path, previous: dict[st
         and csv_path.is_file()
         and summary.get("csv_sha256") == file_sha256(csv_path)
     )
+    if summary_valid:
+        counts = Counter()
+        expected_rows = []
+        for name, entry in components.items():
+            for item in entry["operator_counts"]:
+                counts[(item["domain"], item["op_type"])] += item["count"]
+                expected_rows.append({"component": name, "domain": item["domain"], "op_type": item["op_type"], "count": str(item["count"])})
+        unique = [{"domain": domain, "op_type": op, "count": count} for (domain, op), count in sorted(counts.items())]
+        expected_rows += [{"component": "ALL", **item, "count": str(item["count"])} for item in unique]
+        with csv_path.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        summary_valid = (
+            summary.get("total_node_count") == sum(e["node_count"] for e in components.values())
+            and summary.get("unique_operators") == unique and rows == expected_rows
+            and all(summary.get("components", {}).get(n, {}).get("node_count") == e["node_count"] for n, e in components.items())
+        )
     accepted = source_equivalence and source_evidence_valid and end_to_end_valid and summary_valid
     if profiles == {"real-fixed-shape"}:
         accepted = accepted and shared_checkpoint

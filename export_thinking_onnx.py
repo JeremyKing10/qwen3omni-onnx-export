@@ -13,7 +13,7 @@ import psutil
 import torch
 
 from export_onnx import export_transaction
-from onnx_artifact_utils import model_identity, safe_path, save_tensor_archive, source_snapshot
+from onnx_artifact_utils import check_execution_resources, model_identity, safe_path, save_tensor_archive, source_snapshot
 from qwen3_omni_onnx_cases import (
     DEFAULT_SEED,
     WORKSPACE,
@@ -29,6 +29,7 @@ from qwen3_omni_thinking_components import (
     build_real_thinking_component,
     build_tiny_thinking_component,
     component_routing,
+    inspect_checkpoint,
     load_real_thinking_model,
 )
 
@@ -52,30 +53,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--force", action="store_true", help="覆盖对应组件目录")
+    parser.add_argument("--allow-real-overwrite", action="store_true", help="显式允许 tiny 覆盖 real 或身份未知的现有产物；还需 --force")
     return parser.parse_args()
 
 
 def estimate_weight_bytes(checkpoint_path: Path) -> int:
-    """估算已索引 checkpoint 的权重总字节数；声明值非法或分片缺失时直接失败。"""
-    index_path = checkpoint_path / "model.safetensors.index.json"
-    if not index_path.is_file():
-        raise FileNotFoundError(
-            f"官方 checkpoint 必须包含 model.safetensors.index.json：{index_path}（不支持未索引的单文件权重）"
-        )
-    index = json.loads(index_path.read_text(encoding="utf-8"))
-    declared = index.get("metadata", {}).get("total_size")
-    shard_names = sorted(set(index.get("weight_map", {}).values()))
-    if not shard_names:
-        raise ValueError("权重索引中没有 safetensors shard")
-    total = 0
-    for name in shard_names:
-        shard = checkpoint_path / name
-        if not shard.is_file() or shard.stat().st_size == 0:
-            raise FileNotFoundError(f"权重分片缺失或为空：{shard}")
-        total += shard.stat().st_size
-    if isinstance(declared, bool) or not isinstance(declared, int) or declared <= 0 or declared > total:
-        raise ValueError(f"索引声明的 total_size={declared!r} 非法或超过分片实际总字节 {total}")
-    return declared
+    return inspect_checkpoint(checkpoint_path)["weight_bytes"]
+
+
+def existing_real_evidence(package_dir: Path) -> list[str]:
+    paths = [package_dir / "manifest.json", package_dir / "validation/end_to_end.json"]
+    paths += [package_dir / "onnx" / name / "export_metadata.json" for name in THINKING_COMPONENTS]
+    conflicts = []
+    for candidate in paths:
+        path = safe_path(WORKSPACE, candidate)
+        if path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("not an object")
+                if path.name == "export_metadata.json":
+                    tiny = (data.get("profile") == "tiny-fixed-shape" and data.get("case") == path.parent.name
+                            and data.get("product_component") == path.parent.name
+                            and data.get("official_weights_included") is False and data.get("randomly_initialized") is True
+                            and not data.get("checkpoint_fingerprint"))
+                elif path.name == "end_to_end.json":
+                    tiny = data.get("profile") == "tiny-fixed-shape"
+                else:
+                    tiny = data.get("official_weights_included") is False and data.get("status") in {"tiny-interface-validation-only", "unverified-tiny-artifacts"}
+                if not tiny:
+                    conflicts.append(f"real 或无法确认 tiny 身份：{path}")
+            except (ValueError, TypeError):
+                conflicts.append(f"身份未知：{path}")
+    for name in THINKING_COMPONENTS:
+        root = package_dir / "onnx" / name
+        if (root / "model.onnx").exists() and not (root / "export_metadata.json").is_file():
+            conflicts.append(f"缺少元数据：{root}")
+    return conflicts
+
+
+def authorize_tiny_export(package_dir: Path, allow: bool) -> None:
+    conflicts = existing_real_evidence(package_dir)
+    if conflicts and not allow:
+        raise RuntimeError("拒绝覆盖 real/未知产物，需明确降级授权：" + ", ".join(conflicts))
 
 
 def invalidate_package_evidence(package_dir: Path) -> None:
@@ -115,6 +135,8 @@ def export_component(
     profile: str,
     snapshot: dict[str, Any],
 ) -> dict:
+    if profile.startswith("real-") and (not case.loading_verified or not case.checkpoint_fingerprint):
+        raise RuntimeError("真实导出必须经过完整 checkpoint 加载检查")
     model_path = output_dir / "model.onnx"
     case.model.requires_grad_(False)
     test_vectors = []
@@ -193,6 +215,7 @@ def export_component(
         "fixed_shapes": case.dynamic_shapes is None,
         "dynamic_shape_contract": case.interface if case.dynamic_shapes is not None else None,
         "checkpoint_fingerprint": case.checkpoint_fingerprint,
+        "loading_verified": case.loading_verified,
         "uses_external_data": any(initializer.external_data for initializer in graph.graph.initializer),
         "export_seconds": elapsed,
         "model_bytes": model_path.stat().st_size,
@@ -218,35 +241,9 @@ def main() -> None:
     if args.mode == "real":
         if args.model_path is None:
             raise ValueError("real 模式必须提供 --model-path")
-        if not (isinstance(args.minimum_memory_gib, float) and math.isfinite(args.minimum_memory_gib)
-                and args.minimum_memory_gib > 0):
-            raise ValueError(f"--minimum-memory-gib 必须为有限正数，实际为 {args.minimum_memory_gib}")
-        memory = psutil.virtual_memory()
-        total_memory_gib = memory.total / 1024**3
-        available_memory_gib = memory.available / 1024**3
-        if total_memory_gib < args.minimum_memory_gib or available_memory_gib < args.minimum_memory_gib * 0.75:
-            raise RuntimeError(
-                f"real 模式需要至少 {args.minimum_memory_gib:.0f} GiB 总内存且至少 "
-                f"{args.minimum_memory_gib * 0.75:.0f} GiB 可用；当前总计 {total_memory_gib:.1f} GiB、"
-                f"可用 {available_memory_gib:.1f} GiB"
-            )
         checkpoint_path = args.model_path.expanduser().resolve()
-        if args.device.startswith("cuda"):
-            if not torch.cuda.is_available():
-                raise RuntimeError("请求 CUDA 导出，但 torch.cuda 不可用")
-            device = torch.device(args.device)
-            if device.index is not None and device.index >= torch.cuda.device_count():
-                raise RuntimeError(
-                    f"请求的 CUDA 设备不存在：{args.device}（可用显卡数 {torch.cuda.device_count()}）"
-                )
-            weight_bytes = estimate_weight_bytes(checkpoint_path)
-            free_vram, _ = torch.cuda.mem_get_info(device)
-            required_vram = int(weight_bytes * 1.2)
-            if free_vram < required_vram:
-                raise RuntimeError(
-                    f"CUDA 可用显存 {free_vram / 1024**3:.1f} GiB，小于估算需求 "
-                    f"{required_vram / 1024**3:.1f} GiB"
-                )
+        check_execution_resources(inspect_checkpoint(checkpoint_path), package_dir, args.minimum_memory_gib,
+                                  args.device, "CPUExecutionProvider")
         dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
         full_model = load_real_thinking_model(str(checkpoint_path), dtype=dtype, device=args.device)
 
@@ -269,6 +266,8 @@ def main() -> None:
         export_one,
         evidence=evidence,
         lock_root=package_dir,
+        authorize=(lambda: authorize_tiny_export(package_dir, args.force and args.allow_real_overwrite))
+        if args.mode == "tiny" else None,
     )
 
 

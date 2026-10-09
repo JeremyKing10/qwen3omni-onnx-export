@@ -43,28 +43,8 @@ def operator_report_name(component: str) -> str:
 
 
 def existing_real_evidence(package_dir: Path) -> list[str]:
-    found: list[str] = []
-    manifest = package_dir / "manifest.json"
-    if manifest.is_file():
-        try:
-            payload: Any = json.loads(manifest.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            raise RuntimeError(f"manifest.json 无法解析，拒绝继续以免覆盖无法确认的 real 证据：{manifest}")
-        if payload.get("official_weights_included") or payload.get("status") in {
-            "official-weight-components-validated", "unverified-real-artifacts",
-        }:
-            found.append(str(manifest))
-    for component in THINKING_COMPONENTS:
-        path = package_dir / "onnx" / component / "export_metadata.json"
-        if not path.is_file():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            raise RuntimeError(f"导出元数据无法解析，拒绝继续以免覆盖 real 产物：{path}")
-        if payload.get("profile") == "real-fixed-shape" or payload.get("official_weights_included"):
-            found.append(str(path))
-    return found
+    from export_thinking_onnx import existing_real_evidence as inspect_existing
+    return inspect_existing(package_dir)
 
 
 def main() -> None:
@@ -81,6 +61,8 @@ def main() -> None:
     resolve_package_sources(source_dir=args.source_dir, offline=args.offline)
     export_arguments = ["export_thinking_onnx.py", "--mode", "tiny", "--component", "all",
                         "--package-dir", str(package_dir), "--force"]
+    if args.force:
+        export_arguments.append("--allow-real-overwrite")
     run(*export_arguments)
     for component in THINKING_COMPONENTS:
         model_path = package_dir / "onnx" / component / "model.onnx"

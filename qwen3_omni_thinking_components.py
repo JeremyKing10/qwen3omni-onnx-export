@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -57,6 +58,7 @@ class ThinkingComponentCase:
     dynamic_shapes: Any | None = None
     checkpoint_fingerprint: dict[str, Any] | None = None
     raw_reference_inputs: tuple[torch.Tensor, ...] | None = None
+    loading_verified: bool = False
 
     @property
     def export_args(self) -> tuple[torch.Tensor, ...]:
@@ -133,6 +135,41 @@ class VisionEncoderExportWrapper(nn.Module):
         return (pooled, *deepstack)
 
 
+AUDIO_ATTENTION_CONTRACT = "block_diagonal_cu_seqlens_v1"
+
+
+def audio_block_mask(states: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    positions = torch.arange(states.shape[0], device=states.device)
+    segments = (positions[:, None] >= cu_seqlens[1:][None, :]).sum(-1)
+    same = segments[:, None] == segments[None, :]
+    return torch.where(same, 0.0, torch.finfo(states.dtype).min).to(states.dtype)[None, None]
+
+
+@contextmanager
+def official_audio_block_attention(audio: Qwen3OmniMoeAudioEncoder):
+    """Use upstream's slice-based mask oracle, not the export mask implementation.
+
+    The pinned upstream eager forward omits this mask. This adapter deliberately
+    restores packed-segment isolation; it does not claim equivalence to unmasked eager.
+    """
+    def mask_hook(_module, args, kwargs):
+        states = kwargs.get("hidden_states", args[0] if args else None)
+        boundaries = kwargs["cu_seqlens"]
+        if boundaries.ndim != 1 or boundaries.numel() < 2 or int(boundaries[0]) != 0 or int(boundaries[-1]) != states.shape[0]:
+            raise ValueError("cu_seqlens 必须覆盖完整 token 序列")
+        if bool((boundaries[1:] <= boundaries[:-1]).any()):
+            raise ValueError("cu_seqlens 必须严格递增")
+        kwargs["attention_mask"] = audio._prepare_attention_mask(states, boundaries)
+        return args, kwargs
+
+    hooks = [layer.self_attn.register_forward_pre_hook(mask_hook, with_kwargs=True) for layer in audio.layers]
+    try:
+        yield
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
 class AudioEncoderExportWrapper(nn.Module):
     """Audio CNN + Transformer; variable-length chunk preparation is a host-side contract."""
 
@@ -157,6 +194,7 @@ class AudioEncoderExportWrapper(nn.Module):
         position = self.audio.positional_embedding.positional_embedding[: features.shape[1], :]
         features = features + position.unsqueeze(0).to(features.dtype)
         hidden_states = torch.index_select(features.reshape(-1, features.shape[-1]), 0, valid_indices)
+        attention_mask = audio_block_mask(hidden_states, cu_seqlens)
 
         for layer in self.audio.layers:
             residual = hidden_states
@@ -164,7 +202,7 @@ class AudioEncoderExportWrapper(nn.Module):
             attended = layer.self_attn(
                 hidden_states=normalized,
                 cu_seqlens=cu_seqlens,
-                attention_mask=None,
+                attention_mask=attention_mask,
             )
             hidden_states = residual + attended
             residual = hidden_states
@@ -535,6 +573,8 @@ def assert_prefill_contract(
     input_ids, _, _, _, embeddings, multimodal_mask, visual_mask, *deepstack = args
     image_mask = input_ids == config.image_token_id
     audio_mask = input_ids == config.audio_token_id
+    if not bool(image_mask.any()) or not bool(audio_mask.any()):
+        raise ValueError("当前固定 Prefill 只支持 image+audio+text；纯文本/纯音频需单独导出 profile，不能填零假装有视觉占位")
     if bool((input_ids == config.video_token_id).any()):
         raise ValueError("该 image/audio Prefill profile 不接受 video placeholder")
     if multimodal_mask.dtype != torch.bool or not torch.equal(multimodal_mask, image_mask | audio_mask):
@@ -715,7 +755,8 @@ def build_tiny_thinking_component(component: str, seed: int = DEFAULT_SEED) -> T
         errors = []
         with torch.inference_mode():
             for features, vector in zip((first_features, second_features), vectors):
-                original = normalize_outputs(audio(features, feature_lens=feature_lens).last_hidden_state)
+                with official_audio_block_attention(audio):
+                    original = normalize_outputs(audio(features, feature_lens=feature_lens).last_hidden_state)
                 wrapped = normalize_outputs(wrapper(*vector))
                 errors.append(_assert_close_tuple(wrapped, original, "Audio wrapper"))
         error = max(errors)
@@ -731,8 +772,11 @@ def build_tiny_thinking_component(component: str, seed: int = DEFAULT_SEED) -> T
                 "feature_length_profile": 20,
                 "host_preprocessing": True,
                 "chunk_count": int(vectors[0][0].shape[0]),
+                "attention_contract": AUDIO_ATTENTION_CONTRACT,
+                "reference_adapter": "upstream_slice_mask; differs from unmasked eager",
             },
-            source_equivalence={"checked": True, "max_abs_error": error},
+            source_equivalence={"checked": True, "max_abs_error": error,
+                                "scope": "official_audio_with_independent_block_mask"},
             raw_reference_inputs=(first_features.clone(), feature_lens.clone()),
         )
 
@@ -797,6 +841,9 @@ def build_tiny_thinking_component(component: str, seed: int = DEFAULT_SEED) -> T
                 "cache_outputs": config.num_hidden_layers * 2,
                 "mrope_source": "Qwen3OmniMoeThinkerForConditionalGeneration.get_rope_index",
                 "rope_deltas": [float(first_prompt[4].item()), float(second_prompt[4].item())],
+                "modality_contract": "image+audio+text_fixed_counts",
+                "visual_token_count": len(first_prompt[1]),
+                "audio_token_count": len(first_prompt[2]),
             },
             source_equivalence={
                 "checked": True,
@@ -882,7 +929,55 @@ def component_routing(model: nn.Module, args: tuple[torch.Tensor, ...]) -> dict[
     return capture_routing(model, args)
 
 
+def inspect_checkpoint(model_path: Path) -> dict[str, Any]:
+    """Validate indexed safetensors headers without materializing model weights."""
+    from safetensors import safe_open
+
+    model_path = model_path.expanduser().resolve()
+    config_path = safe_path(model_path, model_path / "config.json", must_exist=True)
+    index_path = safe_path(model_path, model_path / "model.safetensors.index.json", must_exist=True)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    if config.get("model_type") != "qwen3_omni_moe" or config.get("enable_audio_output") is not False:
+        raise ValueError("checkpoint 必须为 Qwen3-Omni Thinking")
+    if config.get("quantization_config"):
+        raise ValueError("当前导出路径不支持量化 checkpoint")
+    mapping = index.get("weight_map")
+    if not isinstance(mapping, dict) or not mapping or not all(
+        isinstance(k, str) and k and isinstance(v, str) and v for k, v in mapping.items()
+    ):
+        raise ValueError("weight_map 必须为非空 tensor 到分片映射")
+    actual = {}
+    total = 0
+    for name in sorted(set(mapping.values())):
+        if Path(name).is_absolute() or ".." in Path(name).parts or not name.endswith(".safetensors"):
+            raise ValueError(f"不安全的 safetensors 分片名：{name}")
+        path = safe_path(model_path, model_path / name, must_exist=True)
+        total += path.stat().st_size
+        with safe_open(str(path), framework="pt", device="cpu") as shard:
+            for key in shard.keys():
+                if key in actual:
+                    raise ValueError(f"重复 tensor：{key}")
+                if shard.get_slice(key).get_dtype() not in {"F16", "BF16", "F32"}:
+                    raise ValueError(f"不支持的权重精度：{key}")
+                actual[key] = name
+    if actual != mapping:
+        raise ValueError("权重索引与 safetensors 中的 tensor 名称/所在分片不一致")
+    declared = index.get("metadata", {}).get("total_size")
+    if type(declared) is not int or not 0 < declared <= total:
+        raise ValueError("metadata.total_size 必须为不超过文件总大小的正整数")
+    return {"config": config, "weight_bytes": total, "tensor_count": len(actual)}
+
+
+def check_loading_info(info: dict[str, Any]) -> None:
+    fields = ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs", "conversion_errors")
+    problems = {name: info.get(name) for name in fields if info.get(name)}
+    if "missing_keys" not in info or problems:
+        raise RuntimeError(f"checkpoint 未完整加载；禁止以随机补权重冒充官方模型：{problems or info}")
+
+
 def fingerprint_checkpoint(model_path: Path) -> dict[str, Any]:
+    inspect_checkpoint(model_path)
     model_path = model_path.expanduser().resolve()
     config_path = safe_path(model_path, model_path / "config.json", must_exist=True)
     index_path = safe_path(model_path, model_path / "model.safetensors.index.json", must_exist=True)
@@ -928,14 +1023,18 @@ def load_real_thinking_model(
     }
     if device != "cpu":
         load_kwargs["device_map"] = device
-    model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
-        str(checkpoint_path),
-        **load_kwargs,
-    ).eval()
+    model, loading_info = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
+        str(checkpoint_path), output_loading_info=True, local_files_only=True, **load_kwargs,
+    )
+    check_loading_info(loading_info)
+    if fingerprint_checkpoint(checkpoint_path) != checkpoint_fingerprint:
+        raise RuntimeError("checkpoint 在加载期间发生变化")
+    model.eval()
     if model.config.enable_audio_output or model.has_talker:
         raise ValueError("该导出器只接受 enable_audio_output=false 的 Thinking checkpoint")
     model.requires_grad_(False)
     model._onnx_checkpoint_provenance = checkpoint_fingerprint
+    model._onnx_loading_verified = True
     return model
 
 
@@ -1007,6 +1106,7 @@ def build_real_thinking_component(
                 "max_abs_error": max(equivalence_errors),
             },
             checkpoint_fingerprint=getattr(full_model, "_onnx_checkpoint_provenance", None),
+            loading_verified=getattr(full_model, "_onnx_loading_verified", False),
             raw_reference_inputs=(first.clone(), grid.to(vision.device).clone()),
         )
 
@@ -1024,7 +1124,8 @@ def build_real_thinking_component(
         equivalence_errors = []
         with torch.inference_mode():
             for features, vector in zip((first, second), vectors):
-                original = normalize_outputs(audio(features, feature_lens=feature_lens).last_hidden_state)
+                with official_audio_block_attention(audio):
+                    original = normalize_outputs(audio(features, feature_lens=feature_lens).last_hidden_state)
                 wrapped = normalize_outputs(wrapper(*vector))
                 equivalence_errors.append(_assert_close_tuple(wrapped, original, "Real Audio wrapper"))
         return ThinkingComponentCase(
@@ -1039,14 +1140,17 @@ def build_real_thinking_component(
                 "feature_length_profile": feature_length,
                 "host_preprocessing": True,
                 "chunk_count": int(vectors[0][0].shape[0]),
+                "attention_contract": AUDIO_ATTENTION_CONTRACT,
+                "reference_adapter": "upstream_slice_mask; differs from unmasked eager",
             },
             source_equivalence={
                 "checked": True,
-                "scope": "official_top_level_with_precomputed_features" if component.startswith("thinker_") else "official_encoder_forward",
+                "scope": "official_audio_with_independent_block_mask",
                 "experts_reference": "official_batched_mm; real eager low-precision equivalence not established",
                 "max_abs_error": max(equivalence_errors),
             },
             checkpoint_fingerprint=getattr(full_model, "_onnx_checkpoint_provenance", None),
+            loading_verified=getattr(full_model, "_onnx_loading_verified", False),
             raw_reference_inputs=(first.clone(), feature_lens.clone()),
         )
 
@@ -1155,6 +1259,9 @@ def build_real_thinking_component(
                 "cache_outputs": text_config.num_hidden_layers * 2,
                 "mrope_source": "Qwen3OmniMoeThinkerForConditionalGeneration.get_rope_index",
                 "rope_deltas": [float(first_prompt[4].item()), float(second_prompt[4].item())],
+                "modality_contract": "image+audio+text_fixed_counts",
+                "visual_token_count": len(first_prompt[1]),
+                "audio_token_count": len(first_prompt[2]),
             },
             source_equivalence={
                 "checked": True,
@@ -1163,6 +1270,7 @@ def build_real_thinking_component(
                 "max_abs_error": max(equivalence_errors),
             },
             checkpoint_fingerprint=getattr(full_model, "_onnx_checkpoint_provenance", None),
+            loading_verified=getattr(full_model, "_onnx_loading_verified", False),
         )
 
     prefill = ThinkerPrefillExportWrapper(text_model, lm_head, deepstack_count).eval()
@@ -1243,4 +1351,5 @@ def build_real_thinking_component(
             max_past_length=text_config.max_position_embeddings - 1,
         ),
         checkpoint_fingerprint=getattr(full_model, "_onnx_checkpoint_provenance", None),
+        loading_verified=getattr(full_model, "_onnx_loading_verified", False),
     )

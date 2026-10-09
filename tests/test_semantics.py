@@ -222,6 +222,57 @@ class SemanticTests(unittest.TestCase):
             self.assertFalse(result["x"]["passed"])
             self.assertFalse(result["x"]["finite"])
 
+    def test_audio_mask_matches_independent_slice_oracle_and_isolates_segments(self):
+        audio = self.cases["audio_encoder"].model.audio
+        states = torch.randn(5, audio.config.d_model)
+        for bounds in ([0, 2, 5], [0, 1, 5]):
+            cu = torch.tensor(bounds, dtype=torch.int32)
+            mask = components.audio_block_mask(states, cu)
+            torch.testing.assert_close(mask, audio._prepare_attention_mask(states, cu), rtol=0, atol=0)
+        cu = torch.tensor([0, 2, 5], dtype=torch.int32)
+        changed = states.clone(); changed[2:] = torch.randn_like(changed[2:]) * 100
+        attention = audio.layers[0].self_attn
+        with torch.inference_mode():
+            mask = components.audio_block_mask(states, cu)
+            first = attention(states, cu_seqlens=cu, attention_mask=mask)
+            second = attention(changed, cu_seqlens=cu, attention_mask=mask)
+            torch.testing.assert_close(first[:2], second[:2], rtol=0, atol=0)
+            old = attention(states, cu_seqlens=cu, attention_mask=None)
+            old_changed = attention(changed, cu_seqlens=cu, attention_mask=None)
+            self.assertGreater(float((old[:2] - old_changed[:2]).abs().max()), 1e-5)
+
+    def test_audio_boundaries_are_live_inputs(self):
+        case = self.cases["audio_encoder"]
+        args = case.export_args
+        with torch.inference_mode():
+            a = case.model(*args)
+            b = case.model(*args[:2], torch.tensor([0, 1, 3], dtype=torch.int32))
+        self.assertFalse(torch.equal(a, b))
+        self.assertEqual(case.interface["attention_contract"], components.AUDIO_ATTENTION_CONTRACT)
+        from export_thinking_onnx import export_component
+        from onnx_artifact_utils import source_snapshot
+        from qwen3_omni_onnx_cases import tensor_dict
+        with tempfile.TemporaryDirectory(prefix=".test-audio-export-", dir=WORKSPACE) as directory:
+            with contextlib.redirect_stdout(io.StringIO()):
+                export_component(case, Path(directory), 18, 1234, "tiny-fixed-shape", source_snapshot())
+            session = ort.InferenceSession(str(Path(directory) / "model.onnx"), providers=["CPUExecutionProvider"])
+            feeds = tensor_dict(case.input_names, args)
+            first = session.run(None, feeds)[0]
+            feeds["cu_seqlens"] = np.array([0, 1, 3], dtype=np.int32)
+            second = session.run(None, feeds)[0]
+            np.testing.assert_allclose(first, a.numpy(), rtol=1e-4, atol=1e-5)
+            np.testing.assert_allclose(second, b.numpy(), rtol=1e-4, atol=1e-5)
+            self.assertFalse(np.array_equal(first, second))
+
+    def test_unsupported_text_only_profile_is_rejected_before_broadcast(self):
+        case = self.cases["thinker_prefill"]
+        args = list(case.export_args)
+        args[0] = torch.ones_like(args[0]); args[5] = torch.zeros_like(args[5]); args[6] = torch.zeros_like(args[6])
+        with self.assertRaisesRegex(ValueError, "纯文本"):
+            components.assert_prefill_contract(tuple(args), components.make_tiny_thinker_config(), 1)
+        self.assertEqual(case.interface["modality_contract"], "image+audio+text_fixed_counts")
+        self.assertEqual(case.interface["visual_token_count"], 4)
+
     def test_bfloat16_cpu_binding_and_compare(self):
         graph = helper.make_graph([helper.make_node("Identity", ["x"], ["y"])], "bf16-identity",
                                   [helper.make_tensor_value_info("x", TensorProto.BFLOAT16, [3])],

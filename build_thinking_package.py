@@ -21,6 +21,7 @@ from onnx_artifact_utils import (
     safe_path,
     source_snapshot,
     verify_artifact_identity,
+    workflow_lock,
 )
 from qwen3_omni_onnx_cases import WORKSPACE
 from qwen3_omni_thinking_components import THINKING_COMPONENTS
@@ -269,7 +270,7 @@ def snapshot_comparison(exported: dict[str, Any], current: dict[str, Any]) -> di
     }
 
 
-def build_package(args: argparse.Namespace, package_dir: Path, previous: dict[str, Any]) -> dict[str, Any]:
+def _build_package_locked(args: argparse.Namespace, package_dir: Path, previous: dict[str, Any]) -> dict[str, Any]:
     for name in ("processor", "onnx", "validation", "operators", "test_data", "tools"):
         safe_path(package_dir, package_dir / name)
     components = {component: collect_component(package_dir, component) for component in THINKING_COMPONENTS}
@@ -439,11 +440,15 @@ def build_package(args: argparse.Namespace, package_dir: Path, previous: dict[st
     return manifest
 
 
-def main() -> None:
-    args = parse_args()
-    package_dir = safe_path(WORKSPACE, args.package_dir.expanduser().absolute())
+def build_package(args: argparse.Namespace, package_dir: Path, previous: dict[str, Any]) -> dict[str, Any]:
+    package_dir = safe_path(WORKSPACE, package_dir)
     if package_dir == WORKSPACE:
         raise ValueError("产品目录不能是工作区根目录")
+    with workflow_lock(package_dir):
+        return _build_package_locked(args, package_dir, previous)
+
+
+def _build_and_publish_locked(args: argparse.Namespace, package_dir: Path) -> None:
     manifest_path = safe_path(package_dir, package_dir / "manifest.json")
     previous = {}
     if manifest_path.is_file():
@@ -454,7 +459,7 @@ def main() -> None:
             pass
     atomic_text(package_dir, manifest_path, json.dumps({"passed": False, "status": "unverified-packaging-in-progress"}) + "\n")
     try:
-        manifest = build_package(args, package_dir, previous)
+        manifest = _build_package_locked(args, package_dir, previous)
         atomic_text(package_dir, manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
     except Exception as error:
         failure = {"schema_version": 2, "passed": False, "status": "unverified-artifacts", "error": str(error)}
@@ -465,6 +470,15 @@ def main() -> None:
         raise SystemExit(1)
     print(f"[OK] package={package_dir}")
     print(f"[OK] status={manifest['status']}")
+
+
+def main() -> None:
+    args = parse_args()
+    package_dir = safe_path(WORKSPACE, args.package_dir.expanduser().absolute())
+    if package_dir == WORKSPACE:
+        raise ValueError("产品目录不能是工作区根目录")
+    with workflow_lock(package_dir):
+        _build_and_publish_locked(args, package_dir)
 
 
 if __name__ == "__main__":

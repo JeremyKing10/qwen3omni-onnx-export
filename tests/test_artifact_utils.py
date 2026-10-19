@@ -7,6 +7,7 @@ import json
 import shutil
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 from unittest.mock import patch
 
@@ -108,9 +109,38 @@ class ArtifactTests(unittest.TestCase):
 
     def test_same_model_verification_is_mutually_exclusive(self):
         path = self.create_model()
-        with validate_onnx.output_lock(self.root / "validation"):
+        with validate_onnx.output_lock(self.root):
             with self.assertRaisesRegex(RuntimeError, "另一导出进程"):
                 self.run_validate(path)
+        self.assertFalse((self.root / "validation.json").exists())
+
+    def test_ort_session_released_even_if_report_failure_traceback_is_retained(self):
+        path = self.create_model()
+        session_original = ort.InferenceSession
+        write_original = validate_onnx.write_json
+        sessions = []
+
+        def create_session(*args, **kwargs):
+            session = session_original(*args, **kwargs)
+            sessions.append(weakref.ref(session))
+            return session
+
+        def fail_report(report_path, payload):
+            if report_path.name == "validation.json":
+                raise RuntimeError("report publication failed")
+            return write_original(report_path, payload)
+
+        retained = None
+        with patch.object(ort, "InferenceSession", side_effect=create_session), patch.object(
+            validate_onnx, "write_json", side_effect=fail_report
+        ):
+            try:
+                self.run_validate(path)
+            except RuntimeError as error:
+                retained = error
+        self.assertIsNotNone(retained)
+        self.assertEqual(len(sessions), 1)
+        self.assertIsNone(sessions[0]())
         self.assertFalse((self.root / "validation.json").exists())
 
     def test_verification_environment_change_rejected(self):

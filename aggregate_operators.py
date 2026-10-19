@@ -13,7 +13,7 @@ from typing import Any
 import onnx
 
 from inspect_onnx import STANDARD_DOMAINS, iter_graph_nodes, value_info_dict
-from onnx_artifact_utils import file_sha256, iter_messages, safe_path, verify_artifact_identity
+from onnx_artifact_utils import file_sha256, iter_messages, safe_path, verify_artifact_identity, workflow_lock
 from qwen3_omni_onnx_cases import WORKSPACE
 from qwen3_omni_thinking_components import THINKING_COMPONENTS
 
@@ -99,11 +99,7 @@ def collect_operator_report(package_dir: Path, component: str) -> dict[str, Any]
     return report
 
 
-def main() -> None:
-    args = parse_args()
-    package_dir = safe_path(WORKSPACE, args.package_dir.expanduser().absolute())
-    if package_dir == WORKSPACE:
-        raise ValueError("产品目录不能是工作区根目录")
+def _aggregate_locked(package_dir: Path) -> None:
     operators_dir = safe_path(package_dir, package_dir / "operators")
     summary_path = safe_path(package_dir, operators_dir / "summary.json")
     csv_path = operators_dir / "all_operators.csv"
@@ -160,6 +156,15 @@ def main() -> None:
     print(f"[OK] operators={csv_path}")
     print(f"[OK] total_nodes={summary['total_node_count']}")
     print(f"[OK] unique_operators={len(totals)}")
+
+
+def main() -> None:
+    args = parse_args()
+    package_dir = safe_path(WORKSPACE, args.package_dir.expanduser().absolute())
+    if package_dir == WORKSPACE:
+        raise ValueError("产品目录不能是工作区根目录")
+    with workflow_lock(package_dir):
+        _aggregate_locked(package_dir)
 
 
 if __name__ == "__main__":

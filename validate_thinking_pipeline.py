@@ -23,6 +23,7 @@ from onnx_artifact_utils import (
     safe_path,
     validate_tolerances,
     verify_artifact_identity,
+    workflow_lock,
 )
 from qwen3_omni_onnx_cases import DEFAULT_SEED, WORKSPACE, tensor_to_numpy, write_json
 from qwen3_omni_thinking_components import (
@@ -312,11 +313,7 @@ def validate_pipeline(args: argparse.Namespace, package_dir: Path, metadata: dic
     return {"comparisons": comparisons, "decode_steps": 3}
 
 
-def main() -> None:
-    args = parse_args()
-    package_dir = safe_path(WORKSPACE, args.package_dir)
-    if package_dir == WORKSPACE.resolve():
-        raise ValueError("产品目录不能是工作区根目录")
+def _validate_and_publish_locked(args: argparse.Namespace, package_dir: Path) -> None:
     output_path = safe_path(WORKSPACE, package_dir / "validation" / "end_to_end.json")
     failure_path = safe_path(WORKSPACE, package_dir / "validation" / "end_to_end.failure.json")
     attempt_started_ns = time.time_ns()
@@ -376,6 +373,15 @@ def main() -> None:
     print(f"[{'OK' if passed else 'FAIL'}] end_to_end={output_path}")
     if not passed:
         raise SystemExit(1)
+
+
+def main() -> None:
+    args = parse_args()
+    package_dir = safe_path(WORKSPACE, args.package_dir)
+    if package_dir == WORKSPACE.resolve():
+        raise ValueError("产品目录不能是工作区根目录")
+    with workflow_lock(package_dir):
+        _validate_and_publish_locked(args, package_dir)
 
 
 if __name__ == "__main__":

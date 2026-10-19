@@ -16,11 +16,12 @@ import onnxruntime as ort
 
 from qwen3_omni_onnx_cases import SUPPORTED_CASES, WORKSPACE, file_sha256, write_json
 from qwen3_omni_thinking_components import THINKING_COMPONENTS
-from export_onnx import output_lock
 from onnx_artifact_utils import (
-    artifact_identity, check_providers, load_tensor_archive, run_ort_session,
-    runtime_identity, safe_path, validate_tolerances, verify_artifact_identity,
+    artifact_identity, check_providers, load_tensor_archive, model_workflow_root, run_ort_session,
+    runtime_identity, safe_path, validate_tolerances, verify_artifact_identity, workflow_lock,
 )
+
+output_lock = workflow_lock
 
 KNOWN_CASES = tuple(SUPPORTED_CASES) + tuple(THINKING_COMPONENTS)
 
@@ -175,7 +176,7 @@ def write_failure(report_path: Path, model_path: Path, error: BaseException, sta
     )
 
 
-def validate_model(args: argparse.Namespace) -> None:
+def _validate_model_locked(args: argparse.Namespace) -> None:
     validate_tolerances(args.rtol, args.atol)
     requested_providers = args.providers or ["CPUExecutionProvider"]
     check_providers(requested_providers)
@@ -200,6 +201,7 @@ def validate_model(args: argparse.Namespace) -> None:
     model_hash = identity["model_sha256"]
     write_failure(failure_path, model_path, RuntimeError("verification in progress or interrupted"), started,
                   identity, attempt_started_ns, attempt_id, state="pending")
+    session = None
     try:
         onnx.checker.check_model(str(model_path), full_check=True)
         shape_inference: dict[str, Any] = {
@@ -305,6 +307,8 @@ def validate_model(args: argparse.Namespace) -> None:
     except (Exception, KeyboardInterrupt) as error:
         write_failure(failure_path, model_path, error, started, identity, attempt_started_ns, attempt_id)
         raise
+    finally:
+        session = None
 
     for vector in report["test_vectors"]:
         for name, stats in vector["comparisons"].items():
@@ -318,13 +322,16 @@ def validate_model(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
-def main() -> None:
-    args = parse_args()
+def validate_model(args: argparse.Namespace) -> None:
     validate_tolerances(args.rtol, args.atol)
     check_providers(args.providers or ["CPUExecutionProvider"])
-    model_path = safe_path(WORKSPACE, args.model, must_exist=True)
-    with output_lock(model_path.parent / "validation"):
-        validate_model(args)
+    root = model_workflow_root(args.model)
+    with workflow_lock(root):
+        _validate_model_locked(args)
+
+
+def main() -> None:
+    validate_model(parse_args())
 
 
 if __name__ == "__main__":

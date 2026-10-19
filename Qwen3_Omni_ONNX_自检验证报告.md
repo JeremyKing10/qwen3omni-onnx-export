@@ -25,7 +25,33 @@
 | 真实媒体与生成质量 | 合成张量测试不是质量基准 |
 | 完整 Qwen BF16 的 CPU/CUDA 执行 | 数据交换支持不等于所有算子内核支持，换 CUDA 不保证成功 |
 
-### 0.1 本轮验收（2026-10-08）
+### 0.1 本轮验收（2026-10-16，仅 N1/N2）
+
+基线 `e9b90e1`；本轮没有修改音频算法、权重加载或模态 profile。修复范围为导出/验证共同锁，以及打包证据采集到最终 manifest 发布的一致性。
+
+```bash
+HF_HUB_OFFLINE=1 HF_HUB_DISABLE_PROGRESS_BARS=1 .venv/bin/python -B -m unittest discover -s tests
+HF_HUB_OFFLINE=1 .venv/bin/python -B run_local_thinking_pipeline.py --offline
+```
+
+| 验收项 | 本轮实际结果 |
+|---|---|
+| 修复前负向回归 | 新增三条跨流程测试在旧实现失败：导出锁未阻止另一进程验证，打包复制/发布期间 E2E 没有被锁阻止 |
+| 完整持久回归 | 105 项通过，Python 退出码 0：公共证据 29、打包 27、语义/E2E 21、事务 12、runner/加载 16 |
+| 真实跨进程锁竞争 | 导出持产品锁时，另一验证进程以预期退出码 1 拒绝；组件已移入备份时仍不重建旧路径 |
+| 打包一致性 | 复制阶段和最终 manifest 发布回调中，E2E 竞争被拒且不写失败 sidecar；锁释放后的真实新失败仍能否决下次打包 |
+| 双向与多入口互斥 | 验证持锁时导出不执行任何 rename；inspect、汇总、E2E、打包 CLI/公开 helper 均遵循同一产品锁。不同产品可独立验证 |
+| 验收中新发现 | 曾出现测试打印 OK 但原生进程退出异常，未计为通过；诊断后在验证器 finally 及时释放自身持有的 ORT 会话，新增保留报告异常 traceback 的 weakref 回归。未使用强制退出或跳过测试 |
+| 完整 tiny 流水线 | 真实重导出、严格验证、独立参考三步 Decode、汇总和打包退出码 0；manifest `passed=true`、`tiny-interface-validation-only` |
+| 图结构与数值 | 仍为 479 节点 / 43 类标准算子 / 0 自定义域；Vision 84、Audio 77、Prefill 160、Decode 158，图哈希与 10 月 8 日一致 |
+| E2E 最大绝对误差 | Vision 5.58794e-09、Audio 6.98492e-10、Prefill 及三步 Decode 8.34465e-07 |
+| 早期回归 | rmsnorm、moe_block、tiny_thinker 导出/验证/inspect 共九条命令退出码均为 0 |
+| 随包工具 | `tools/` 对应根目录源码文件逐字节一致；源码快照与验收文件重新生成，不手工修改 JSON 造通过 |
+| 阶段复核 | 独立只读复核和 27 项打包测试通过，未发现本轮新增确定阻断，不等于无 bug 证明 |
+
+本轮仍未批准 N3～N6：完整身份扫描中断前尚未登记 pending；音频非法边界/扩展长度问题；存储精度与加载精度预算问题。eager 与 batched_mm 的全规模低精度差异亦未验收。官方 30B、真实 GPU、断电恢复、全部跨流程时序都不在本轮通过范围内。文件锁仅保护合作使用当前协议的入口，不保护外部手工写入或旧工具。
+
+### 0.2 历史验收（2026-10-08）
 
 本轮在 macOS arm64、48 GiB、Python 3.11.9 / torch 2.8.0 / ONNX 1.22.0 / ORT 1.30.0 中执行：
 
@@ -53,7 +79,7 @@ HF_HUB_OFFLINE=1 .venv/bin/python -B run_local_thinking_pipeline.py --offline
 
 固定 Prefill **只支持 image+audio+text 且视觉/音频 token 数固定**。没有为纯文本、纯音频、任意视频组合补通用 profile；这些会在宿主契约检查时明确拒绝。官方 30B、真实 CUDA、完整低精度图、全部动态长度与真实媒体质量仍未验收，不能保证不存在其他潜在问题。
 
-### 0.2 历史验收（2026-09-23）
+### 0.3 历史验收（2026-09-23）
 
 - 持久回归入口：`python -B -m unittest discover -s tests -v`，测试位于 `tests/test_*.py`，公共产物逻辑在 `onnx_artifact_utils.py`。
 - 已有局部测试事实：内存内 CPU IOBinding Cast/Identity 小图与 BF16 NPZ bit-preserving 往返成功；此结论仅覆盖 BF16 数据交换，不代表完整 Qwen BF16 内核可用。

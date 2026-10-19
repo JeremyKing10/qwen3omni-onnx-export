@@ -8,7 +8,7 @@ from typing import Any, Iterable
 import onnx
 
 from qwen3_omni_onnx_cases import WORKSPACE, file_sha256, write_json
-from onnx_artifact_utils import artifact_identity, external_data_files, iter_messages, safe_path
+from onnx_artifact_utils import artifact_identity, external_data_files, iter_messages, model_workflow_root, safe_path, workflow_lock
 
 STANDARD_DOMAINS = {"", "ai.onnx", "ai.onnx.ml"}
 
@@ -61,10 +61,9 @@ def safe_external_path(model_dir: Path, location: str) -> Path:
     return safe_path(model_dir, model_dir / candidate, must_exist=True)
 
 
-def main() -> None:
-    args = parse_args()
+def _inspect_locked(args: argparse.Namespace, root: Path) -> None:
     model_path = safe_path(WORKSPACE, args.model, must_exist=True)
-    output_path = safe_path(WORKSPACE, args.output or model_path.parent / "operators.json")
+    output_path = safe_path(root, args.output or model_path.parent / "operators.json")
     if output_path.suffix != ".json" or output_path.name in {"export_metadata.json", "validation.json", "manifest.json"}:
         raise ValueError("算子报告必须使用独立 JSON 文件，不能覆盖模型、元数据或验证报告")
 
@@ -141,6 +140,14 @@ def main() -> None:
     print(f"[OK] report={output_path}")
     if not report["passed"]:
         raise SystemExit(1)
+
+
+def main() -> None:
+    args = parse_args()
+    root = model_workflow_root(args.model)
+    safe_path(root, args.output or Path(args.model).expanduser().absolute().parent / "operators.json")
+    with workflow_lock(root):
+        _inspect_locked(args, root)
 
 
 if __name__ == "__main__":

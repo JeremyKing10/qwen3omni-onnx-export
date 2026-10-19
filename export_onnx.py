@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
-import os
 import shutil
 import tempfile
 import time
 import warnings
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable
 
-from onnx_artifact_utils import model_identity, safe_path, save_tensor_archive, source_snapshot
+from onnx_artifact_utils import model_identity, safe_path, save_tensor_archive, source_snapshot, workflow_lock
 
 import numpy as np
 import onnx
@@ -65,20 +62,7 @@ def prepare_output_dir(path: Path, force: bool) -> Path:
     return path
 
 
-@contextmanager
-def output_lock(root: Path) -> Iterator[None]:
-    root = safe_path(WORKSPACE, root)
-    root.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = safe_path(WORKSPACE, root.parent / f".{root.name}.export.lock")
-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    try:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise RuntimeError(f"另一导出进程正在使用 {root}") from error
-        yield
-    finally:
-        os.close(descriptor)
+output_lock = workflow_lock
 
 
 def export_transaction(

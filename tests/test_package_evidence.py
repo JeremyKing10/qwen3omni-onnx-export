@@ -7,8 +7,13 @@ import copy
 import io
 import json
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
+
+import export_onnx as export
+import validate_thinking_pipeline as e2e
 from pathlib import Path
 from unittest.mock import patch
 
@@ -329,6 +334,150 @@ class PackageEvidenceTests(unittest.TestCase):
         failure = json.loads(path.read_text())
         self.assertFalse(failure["passed"])
         self.assertEqual(failure["status"], "unverified-artifacts")
+
+    def run_other_process(self, module, *arguments):
+        return subprocess.run(
+            [sys.executable, "-B", str(utils.WORKSPACE / f"{module}.py"), *map(str, arguments)],
+            cwd=utils.WORKSPACE, capture_output=True, text=True, timeout=30,
+        )
+
+    def test_product_export_lock_blocks_component_validation_in_another_process(self):
+        root = self.create_component()
+        before = (root / "validation.json").read_bytes()
+        with export.output_lock(self.product):
+            result = self.run_other_process("validate_onnx", "--model", root / "model.onnx")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("正在使用", result.stderr)
+            moved = self.root / "component-in-backup"
+            root.rename(moved)
+            try:
+                result = self.run_other_process("validate_onnx", "--model", root / "model.onnx")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("正在使用", result.stderr)
+                self.assertFalse(root.exists())
+            finally:
+                moved.rename(root)
+        self.assertEqual(before, (root / "validation.json").read_bytes())
+        self.invoke(validate_onnx, "--model", root / "model.onnx")
+
+    def test_build_copy_blocks_new_e2e_failure_in_another_process(self):
+        source, _, _ = self.create_complete_product()
+        before = (self.product / "validation/end_to_end.json").read_bytes()
+        copy_original = package.copy_checked
+        probed = []
+
+        def attempt_during_copy(*arguments):
+            if not probed:
+                result = self.run_other_process("validate_thinking_pipeline", "--package-dir", self.product)
+                probed.append(result)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("正在使用", result.stderr)
+                self.assertFalse((self.product / "validation/end_to_end.failure.json").exists())
+            return copy_original(*arguments)
+
+        with patch.object(package, "copy_checked", side_effect=attempt_during_copy):
+            manifest = package.build_package(self.args(source), self.product, {})
+        self.assertTrue(manifest["passed"])
+        self.assertEqual(len(probed), 1)
+        self.assertEqual(before, (self.product / "validation/end_to_end.json").read_bytes())
+        identities = manifest["artifact_identities"]
+        with patch.object(e2e, "load_component_evidence", return_value=(identities, {})), patch.object(
+            e2e, "validate_pipeline", side_effect=RuntimeError("new failure after packaging released the lock")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "new failure"):
+                self.invoke(e2e, "--package-dir", self.product)
+        self.assertFalse(package.build_package(self.args(source), self.product, manifest)["passed"])
+
+    def test_manifest_publish_still_holds_product_lock(self):
+        source, _, _ = self.create_complete_product()
+        write_original = package.atomic_text
+        published = []
+
+        def attempt_at_publish(root, path, text):
+            payload = json.loads(text)
+            if payload.get("passed") is True:
+                with self.assertRaisesRegex(RuntimeError, "正在使用"):
+                    self.invoke(e2e, "--package-dir", self.product)
+                self.assertFalse((self.product / "validation/end_to_end.failure.json").exists())
+                published.append(True)
+            return write_original(root, path, text)
+
+        with patch.object(package, "atomic_text", side_effect=attempt_at_publish):
+            self.invoke(package, "--package-dir", self.product, "--source-dir", source, "--offline")
+        self.assertEqual(published, [True])
+        self.assertTrue(json.loads((self.product / "manifest.json").read_text())["passed"])
+
+    def test_product_lock_blocks_all_report_writers_without_changing_evidence(self):
+        source, _, _ = self.create_complete_product()
+        manifest_path = self.product / "manifest.json"
+        manifest_path.write_text(json.dumps({"passed": True, "status": "fixture-pass"}))
+        before = {str(path.relative_to(self.product)): path.read_bytes()
+                  for path in self.product.rglob("*") if path.is_file()}
+        commands = (
+            (validate_onnx, ("--model", self.product / "onnx/vision_encoder/model.onnx")),
+            (inspect_onnx, ("--model", self.product / "onnx/audio_encoder/model.onnx",
+                            "--output", self.product / "operators/audio.json")),
+            (aggregate, ("--package-dir", self.product)),
+            (e2e, ("--package-dir", self.product)),
+            (package, ("--package-dir", self.product, "--source-dir", source, "--offline")),
+        )
+        with export.output_lock(self.product):
+            for module, arguments in commands:
+                with self.subTest(module=module.__name__), self.assertRaisesRegex(RuntimeError, "正在使用"):
+                    self.invoke(module, *arguments)
+            with self.assertRaisesRegex(RuntimeError, "正在使用"):
+                package.build_package(self.args(source), self.product, {})
+            args = argparse.Namespace(model=self.product / "onnx/vision_encoder/model.onnx", case=None,
+                                      rtol=1e-4, atol=1e-5, skip_shape_inference=False, providers=None)
+            with self.assertRaisesRegex(RuntimeError, "正在使用"):
+                validate_onnx.validate_model(args)
+        after = {str(path.relative_to(self.product)): path.read_bytes()
+                 for path in self.product.rglob("*") if path.is_file()}
+        self.assertEqual(before, after)
+
+    def test_component_verification_blocks_export_without_target_recreation(self):
+        source, _, _ = self.create_complete_product()
+        component = self.product / "onnx/vision_encoder"
+        rename_original = Path.rename
+        export_callback = unittest.mock.Mock()
+        attempted = []
+        write_original = validate_onnx.write_json
+
+        def attempt_export_during_report(path, payload):
+            if path.name == "validation.json" and not attempted:
+                with patch.object(Path, "rename", wraps=rename_original) as rename:
+                    with self.assertRaisesRegex(RuntimeError, "正在使用"):
+                        export.export_transaction({"vision_encoder": component}, True, export_callback,
+                                                  evidence=(self.product / "manifest.json",), lock_root=self.product)
+                    rename.assert_not_called()
+                attempted.append(True)
+            return write_original(path, payload)
+
+        before_model = (component / "model.onnx").read_bytes()
+        with patch.object(validate_onnx, "write_json", side_effect=attempt_export_during_report):
+            self.invoke(validate_onnx, "--model", component / "model.onnx")
+        self.assertEqual(attempted, [True])
+        export_callback.assert_not_called()
+        self.assertEqual(before_model, (component / "model.onnx").read_bytes())
+        self.assertFalse(list(self.root.glob(".product.transaction-*")))
+
+    def test_independent_product_can_validate_while_first_product_is_locked(self):
+        first = self.create_component()
+        other = self.root / "other-product"
+        shutil.copytree(self.product, other)
+        with export.output_lock(self.product):
+            self.invoke(validate_onnx, "--model", other / "onnx/vision_encoder/model.onnx")
+            self.assertEqual(utils.model_workflow_root(first / "model.onnx"), self.product)
+            self.assertEqual(utils.model_workflow_root(other / "onnx/vision_encoder/model.onnx"), other)
+        self.assertFalse((other / "validation/end_to_end.failure.json").exists())
+
+    def test_inspection_cannot_write_another_products_report(self):
+        self.create_component()
+        other = self.root / "other-product"
+        path = other / "operators/vision.json"
+        with self.assertRaisesRegex(ValueError, "路径越出"):
+            self.invoke(inspect_onnx, "--model", self.product / "onnx/vision_encoder/model.onnx", "--output", path)
+        self.assertFalse(other.exists())
 
     def test_snapshot_difference_does_not_mislabel_packaging_as_export(self):
         original = utils.source_snapshot()

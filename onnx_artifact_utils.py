@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import fcntl
 import hashlib
 import importlib.metadata
 import json
@@ -8,6 +9,7 @@ import math
 import os
 import platform
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -59,6 +61,40 @@ def safe_path(root: Path, path: Path, *, must_exist: bool = False) -> Path:
     if must_exist and not resolved.is_file():
         raise FileNotFoundError(f"缺少普通文件：{resolved}")
     return resolved
+
+
+def model_workflow_root(model_path: Path) -> Path:
+    model_path = safe_path(WORKSPACE, model_path)
+    if model_path.parent.parent.name == "onnx":
+        root = model_path.parent.parent.parent
+    else:
+        root = model_path.parent
+    if root == WORKSPACE:
+        raise ValueError("模型必须位于独立模型目录或产品的 onnx/组件目录内")
+    return root
+
+
+@contextmanager
+def workflow_lock(root: Path) -> Iterator[None]:
+    """Exclusive, non-reentrant lock shared by all writers of one product.
+
+    Keep the lock file outside replaceable directories and never unlink it.
+    Each public write entry acquires once and delegates to a locked worker.
+    """
+    root = safe_path(WORKSPACE, root)
+    if root == WORKSPACE:
+        raise ValueError("产品锁不能以工作区根目录为目标")
+    root.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = safe_path(WORKSPACE, root.parent / f".{root.name}.export.lock")
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(f"另一导出进程或产品操作正在使用 {root}，本次操作未执行") from error
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def iter_messages(message: Message, wanted: type) -> Iterator[Any]:
